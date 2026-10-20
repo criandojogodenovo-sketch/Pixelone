@@ -291,4 +291,300 @@ class PngExportTest {
         ByteArrayInputStream(bytes).read(readable)
         assertTrue(readable.contentEquals(bytes))
     }
+
+    // ------------------------------------------------------------------
+    // 6) ESCALA (1x, 2x, 4x, 8x, 16x) — nearest-neighbor, píxeis nítidos
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `escala 1x com fundo transparente é o caminho exato igual ao original`() {
+        val w = 5
+        val h = 4
+        val doc = PixelDocument(w, h)
+        for (y in 0 until h) for (x in 0 until w) {
+            doc.set(x, y, if ((x + y) % 3 == 0) 0x00000000 else 0xFFF57C00.toInt())
+        }
+        // Inclui alfa baixo: no caminho 1x tem de sobreviver BYTE-EXATO
+        doc.set(0, 0, 0x01ABCDEF.toInt())
+        doc.set(1, 1, 0x40FF57C0.toInt())
+
+        val viaOverload = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X1, PngExport.BackgroundOption.TRANSPARENT
+        )
+        val direto = PngExport.buildBitmapFromDocument(doc)
+
+        assertEquals(w, viaOverload.width)
+        assertEquals(h, viaOverload.height)
+        val got = IntArray(w * h)
+        viaOverload.getPixels(got, 0, w, 0, 0, w, h)
+        val expected = doc.copyPixels()
+        for (i in expected.indices) {
+            assertEquals("píxel $i difere no caminho 1x", expected[i], got[i])
+        }
+        val gotDireto = IntArray(w * h)
+        direto.getPixels(gotDireto, 0, w, 0, 0, w, h)
+        assertTrue("1x transparente == buildBitmapFromDocument", got.contentEquals(gotDireto))
+    }
+
+    @Test
+    fun `escala 4x produz blocos nítidos de 4 por 4 sem cores interpoladas`() {
+        val w = 2
+        val h = 2
+        val doc = PixelDocument(w, h)
+        val laranja = 0xFFF57C00.toInt()
+        val preto = 0xFF0A0A0A.toInt()
+        val branco = 0xFFFFFFFF.toInt()
+        val transparente = 0x00000000
+        doc.set(0, 0, laranja)
+        doc.set(1, 0, preto)
+        doc.set(0, 1, transparente)
+        doc.set(1, 1, branco)
+
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X4, PngExport.BackgroundOption.TRANSPARENT
+        )
+
+        assertEquals("largura final = w*4", 8, bmp.width)
+        assertEquals("altura final = h*4", 8, bmp.height)
+        assertEquals(Bitmap.Config.ARGB_8888, bmp.config)
+        val got = IntArray(8 * 8)
+        bmp.getPixels(got, 0, 8, 0, 0, 8, 8)
+
+        // Cada píxel da origem vira um bloco EXATO de 4×4 da MESMA cor —
+        // nenhum tom interpolado/suavizado no meio.
+        val origem = arrayOf(laranja, preto, transparente, branco)
+        for (by in 0 until 2) for (bx in 0 until 2) {
+            val cor = origem[by * 2 + bx]
+            for (dy in 0 until 4) for (dx in 0 until 4) {
+                val px = got[(by * 4 + dy) * 8 + (bx * 4 + dx)]
+                assertEquals("bloco ($bx,$by) d/($dx,$dy) deve ser $cor", cor, px)
+            }
+        }
+
+        // Nearest-neighbor estrito: o PNG só contém as 4 cores da origem
+        val distintas = got.toSet()
+        assertEquals("nenhuma cor interpolada pode aparecer", origem.toSet(), distintas)
+    }
+
+    @Test
+    fun `escala 16x de canvas pequeno dá dimensões exatas e preserve alfa`() {
+        val w = 3
+        val h = 2
+        val doc = PixelDocument(w, h)
+        for (y in 0 until h) for (x in 0 until w) {
+            doc.set(x, y, if ((x + y) % 2 == 0) 0xFFF57C00.toInt() else 0x00000000)
+        }
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X16, PngExport.BackgroundOption.TRANSPARENT
+        )
+        assertEquals(48, bmp.width)
+        assertEquals(32, bmp.height)
+
+        // Píxeis transparentes continuam 100% transparentes (sem fundo)
+        val got = IntArray(48 * 32)
+        bmp.getPixels(got, 0, 48, 0, 0, 48, 32)
+        for (by in 0 until 2) for (bx in 0 until 3) {
+            if ((bx + by) % 2 != 0) {
+                val px = got[(by * 16) * 48 + bx * 16]
+                assertEquals("bloco transparente ($bx,$by)", 0x00000000, px)
+            }
+        }
+    }
+
+    @Test
+    fun `roundtrip PNG com escala 2x escreve dimensões finais no IHDR`() {
+        val w = 6
+        val h = 4
+        val doc = PixelDocument(w, h)
+        for (y in 0 until h) for (x in 0 until w) {
+            doc.set(x, y, if ((x + y) % 2 == 0) 0xFFF57C00.toInt() else 0xFF0A0A0A.toInt())
+        }
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X2, PngExport.BackgroundOption.TRANSPARENT
+        )
+        assertEquals(12, bmp.width)
+        assertEquals(8, bmp.height)
+        val out = ByteArrayOutputStream()
+        val result = PngExport.writePngToStream(bmp, out)
+        assertTrue(result.ok)
+        assertTrue("PNG 2x não pode ser vazio", result.bytes > 20)
+
+        val bytes = out.toByteArray()
+        // IHDR: largura/altura do FICHEIRO real = 12 × 8 (big-endian)
+        assertEquals(12, ((bytes[16].toInt() and 0xFF) shl 24) or
+            ((bytes[17].toInt() and 0xFF) shl 16) or
+            ((bytes[18].toInt() and 0xFF) shl 8) or
+            (bytes[19].toInt() and 0xFF))
+        assertEquals(8, ((bytes[20].toInt() and 0xFF) shl 24) or
+            ((bytes[21].toInt() and 0xFF) shl 16) or
+            ((bytes[22].toInt() and 0xFF) shl 8) or
+            (bytes[23].toInt() and 0xFF))
+    }
+
+    // ------------------------------------------------------------------
+    // 7) FUNDO: transparente (padrão) ou preto sólido via drawColor
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `fundo preto preenche píxeis transparentes e preserva a arte opaca`() {
+        val w = 2
+        val h = 1
+        val doc = PixelDocument(w, h)
+        val laranja = 0xFFF57C00.toInt()
+        doc.set(0, 0, laranja)
+        doc.set(1, 0, 0x00000000) // transparente → tem de ficar preto
+
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X2, PngExport.BackgroundOption.SOLID_BLACK
+        )
+        assertEquals(4, bmp.width)
+        assertEquals(2, bmp.height)
+        val got = IntArray(4 * 2)
+        bmp.getPixels(got, 0, 4, 0, 0, 4, 2)
+
+        // Arte opaca preservada byte a byte (nearest-neighbor, sem mistura)
+        for (dy in 0 until 2) for (dx in 0 until 2) {
+            assertEquals("arte opaca preservada", laranja, got[dy * 4 + dx])
+        }
+        // Onde era transparente: preto sólido OPACO (0xFF000000), não preto
+        // translúcido e não transparente
+        for (dy in 0 until 2) for (dx in 2 until 4) {
+            assertEquals(
+                "fundo deve ser preto sólido",
+                0xFF000000.toInt(), got[dy * 4 + dx]
+            )
+        }
+        val distintas = got.toSet()
+        assertTrue(
+            "só podem existir as duas cores esperadas, got=$distintas",
+            distintas == setOf(laranja, 0xFF000000.toInt())
+        )
+    }
+
+    @Test
+    fun `fundo preto achata semi-transparência sobre preto com alfa 255`() {
+        val w = 1
+        val h = 1
+        val doc = PixelDocument(w, h)
+        // Laranja a 50% de alfa — valores escolhidos para que truncamento e
+        // arredondamento do Skia concordem (192*128/255=96.37, 128→64.25,
+        // 64→32.12; todos longe da fronteira do .5)
+        doc.set(0, 0, 0x80C08040.toInt())
+
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X1, PngExport.BackgroundOption.SOLID_BLACK
+        )
+        val got = IntArray(1)
+        bmp.getPixels(got, 0, 1, 0, 0, 1, 1)
+        // Flatten sobre preto: alfa passa a 255 (src-over sobre destino
+        // opaco); RGB = canal * alfa / 255 (a cor verdadeiramente "vista")
+        assertEquals(255, (got[0] ushr 24) and 0xFF)
+        assertEquals(96, (got[0] shr 16) and 0xFF)  // 0xC0 * 0x80 / 0xFF
+        assertEquals(64, (got[0] shr 8) and 0xFF)   // 0x80 * 0x80 / 0xFF
+        assertEquals(32, got[0] and 0xFF)           // 0x40 * 0x80 / 0xFF
+    }
+
+    @Test
+    fun `fundo transparente mantém alfa zero na escala`() {
+        val w = 2
+        val h = 2
+        val doc = PixelDocument(w, h)
+        doc.set(0, 0, 0xFFF57C00.toInt())
+        doc.set(1, 0, 0x00000000)
+        doc.set(0, 1, 0x00000000)
+        doc.set(1, 1, 0xFFF57C00.toInt())
+
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X8, PngExport.BackgroundOption.TRANSPARENT
+        )
+        assertEquals(16, bmp.width)
+        assertEquals(16, bmp.height)
+        val got = IntArray(16 * 16)
+        bmp.getPixels(got, 0, 16, 0, 0, 16, 16)
+        // Canto superior direito (origem 1,0 → bloco em x=8..15, y=0..7):
+        // transparente
+        assertEquals(0x00000000, got[3 * 16 + 12])
+        // Centro do bloco opaco (origem 0,0): opaco
+        assertEquals(0xFFF57C00.toInt(), got[4 * 16 + 4])
+    }
+
+    // ------------------------------------------------------------------
+    // 8) Limites de memória e Paint nearest-neighbor
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `escala que excede o lado máximo é rejeitada antes de alocar`() {
+        val ex = assertThrows(IllegalStateException::class.java) {
+            PngExport.validateScaledDimensions(2048, 2048, 16) // 32768 > 16384
+        }
+        assertTrue(
+            "mensagem deve mencionar a escala e o lado máximo: ${ex.message}",
+            ex.message!!.contains("16x") && ex.message!!.contains("16384")
+        )
+    }
+
+    @Test
+    fun `escala que excede o orçamento de píxeis é rejeitada`() {
+        // 2048×2048 a 8x = 16384×16384 = 268M píxeis > 32 MP
+        val ex = assertThrows(IllegalStateException::class.java) {
+            PngExport.validateScaledDimensions(2048, 2048, 8)
+        }
+        assertTrue(
+            "mensagem deve mencionar o orçamento de píxeis: ${ex.message}",
+            ex.message!!.contains("33554432")
+        )
+        // 2048×2048 a 4x = 8192×8192 = 67M píxeis — também acima de 32 MP
+        assertThrows(IllegalStateException::class.java) {
+            PngExport.validateScaledDimensions(2048, 2048, 4)
+        }
+    }
+
+    @Test
+    fun `escalas normais de pixel art são aceites`() {
+        // 16..128 px a 16x: 128×128 → 2048×2048 = 4,2 MP — OK
+        PngExport.validateScaledDimensions(128, 128, 16)
+        PngExport.validateScaledDimensions(64, 64, 16)
+        PngExport.validateScaledDimensions(256, 256, 16) // 4096×4096 = 16,7 MP OK
+        PngExport.validateScaledDimensions(2048, 2048, 1)
+        PngExport.validateScaledDimensions(2048, 2048, 2) // 4096×4096 = 16,7 MP OK
+    }
+
+    @Test
+    fun `canvas pequeno a 16x produz bitmap final válido 64 por 64`() {
+        val doc = PixelDocument(4, 4)
+        for (y in 0 until 4) for (x in 0 until 4) {
+            doc.set(x, y, if ((x + y) % 2 == 0) 0xFFF57C00.toInt() else 0x00000000)
+        }
+        // 4×4 a 16x = 64×64 = 4 096 píxeis — muito abaixo dos limites: tem
+        // de produzir o bitmap final completo, sem lançar exceção
+        val bmp = PngExport.buildBitmapFromDocument(
+            doc, PngExport.ScaleOption.X16, PngExport.BackgroundOption.TRANSPARENT
+        )
+        assertEquals(64, bmp.width)
+        assertEquals(64, bmp.height)
+        assertFalse(bmp.isRecycled)
+        // O bitmap ORIGINAL usado como origem foi reciclado — só o final é
+        // devolvido ao chamador
+        val got = IntArray(64 * 64)
+        bmp.getPixels(got, 0, 64, 0, 0, 64, 64)
+        assertEquals(0xFFF57C00.toInt(), got[0]) // bloco (0,0) laranja
+        assertEquals(0x00000000, got[63])        // bloco (3,0) transparente
+    }
+
+    @Test
+    fun `paint nearest-neighbor tem filter e antiAlias desligados`() {
+        val paint = PngExport.nearestNeighborPaint()
+        assertFalse("isFilterBitmap=false (sem suavização)", paint.isFilterBitmap)
+        assertFalse("isAntiAlias=false (sem bordas macias)", paint.isAntiAlias)
+    }
+
+    @Test
+    fun `opções de escala expõem os fatores pedidos`() {
+        assertEquals(
+            listOf(1, 2, 4, 8, 16),
+            PngExport.ScaleOption.entries.map { it.factor }
+        )
+        assertEquals("1x", PngExport.ScaleOption.X1.label)
+        assertEquals("16x", PngExport.ScaleOption.X16.label)
+    }
 }

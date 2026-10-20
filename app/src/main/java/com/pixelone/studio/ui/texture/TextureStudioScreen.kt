@@ -60,9 +60,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pixelone.studio.editor.EditorViewModel
 import com.pixelone.studio.editor.PixelIcons
+import com.pixelone.studio.export.PngExport
 import com.pixelone.studio.pixel.PixelEngine
 import com.pixelone.studio.ui.editor.ColorPickerDialog
 import com.pixelone.studio.ui.editor.ConfirmDiscardDialog
+import com.pixelone.studio.ui.editor.ExportOptionsDialog
 import com.pixelone.studio.ui.editor.NewProjectDialog
 import com.pixelone.studio.ui.editor.OpenProjectSheet
 import com.pixelone.studio.ui.editor.PixelCanvas
@@ -91,9 +93,15 @@ fun TextureStudioScreen(onBack: () -> Unit) {
     var showColorPicker by remember { mutableStateOf(false) }
     var showOpenSheet by remember { mutableStateOf(false) }
     var showConfirmDiscard by remember { mutableStateOf(false) }
+    var showExportDialog by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var overlay by remember { mutableStateOf<Overlay>(Overlay.None) }
     var pendingAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    // Escolhas do diálogo de exportação (persistem para o caminho legado
+    // SAF, em que o launcher corre DEPOIS de o diálogo fechar).
+    var pendingExportScaleIndex by remember { mutableStateOf(0) }
+    var pendingExportBackgroundIndex by remember { mutableStateOf(0) }
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -103,7 +111,15 @@ fun TextureStudioScreen(onBack: () -> Unit) {
     // Este launcher SAF fica apenas como caminho legado de Android < 10.
     val exportPngLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("image/png")
-    ) { uri -> if (uri != null) viewModel.exportPng(uri) {} }
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportPng(
+                uri,
+                PngExport.ScaleOption.entries[pendingExportScaleIndex],
+                PngExport.BackgroundOption.entries[pendingExportBackgroundIndex]
+            ) {}
+        }
+    }
 
     val saveAsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -208,14 +224,12 @@ fun TextureStudioScreen(onBack: () -> Unit) {
                         IconButton(
                             enabled = doc != null,
                             onClick = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                    // Direto para Download/ (MediaStore, IS_PENDING):
-                                    // cria o ficheiro só quando o conteúdo está
-                                    // escrito — nunca mais um PNG 0 bytes.
-                                    viewModel.exportPngToDownloads()
-                                } else {
-                                    exportPngLauncher.launch("${viewModel.projectName}.png")
-                                }
+                                // Primeiro as opções (escala 1x-16x + fundo);
+                                // o destino é escolhido a seguir: Download/
+                                // direto (MediaStore, IS_PENDING) em Android
+                                // 10+ — o ficheiro só nasce com conteúdo —
+                                // ou seletor SAF em Android < 10.
+                                showExportDialog = true
                             }
                         ) {
                             Icon(PixelIcons.export(), contentDescription = "Exportar PNG", tint = MaterialTheme.colorScheme.onSurface)
@@ -342,6 +356,34 @@ fun TextureStudioScreen(onBack: () -> Unit) {
                 viewModel.saveProject { action?.invoke() }
             }
         )
+    }
+
+    if (showExportDialog) {
+        val d = viewModel.document
+        if (d == null) {
+            showExportDialog = false
+        } else {
+            ExportOptionsDialog(
+                canvasWidth = d.width,
+                canvasHeight = d.height,
+                onDismiss = { showExportDialog = false },
+                onExport = { scale, background ->
+                    showExportDialog = false
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        // Direto para Download/ (MediaStore, IS_PENDING):
+                        // cria o ficheiro só quando o conteúdo está escrito
+                        // — nunca mais um PNG 0 bytes.
+                        viewModel.exportPngToDownloads(scale, background)
+                    } else {
+                        // Caminho legado: guardar as escolhas para o
+                        // callback do launcher (corre depois do diálogo).
+                        pendingExportScaleIndex = scale.ordinal
+                        pendingExportBackgroundIndex = background.ordinal
+                        exportPngLauncher.launch("${viewModel.projectName}.png")
+                    }
+                }
+            )
+        }
     }
 }
 
