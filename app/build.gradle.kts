@@ -28,8 +28,32 @@ android {
         // pronto para OpenGL ES 3.0 nas fases 3D futuras.
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0-fases1-2"
+        versionCode = 3
+        versionName = "0.3.0-performance"
+
+        ndk {
+            // Preserva a cobertura de ABIs do projeto (sem nativo antes,
+            // todas eram possíveis): arm64-v8a/armeabi-v7a para telemóveis,
+            // x86_64/x86 para emuladores.
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+        }
+
+        externalNativeBuild {
+            cmake {
+                // C++17 explícito; STL estática (lib pequena, sem dependência
+                // dinâmica de libc++). As flags de otimização -O3 em Release
+                // ficam no CMakeLists.txt por configuração de build.
+                cppFlags += listOf("-std=c++17")
+                arguments += listOf("-DANDROID_STL=c++_static")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     signingConfigs {
@@ -74,6 +98,9 @@ android {
             // Robolectric precisa dos recursos Android para testar o
             // roundtrip PNG real (Bitmap.compress/BitmapFactory).
             isIncludeAndroidResources = true
+            // NativeEngine (fallback JVM) usa android.util.Log via PerfLog:
+            // devolve valores por omissão nos testes unitários JVM.
+            isReturnDefaultValues = true
         }
     }
 }
@@ -102,4 +129,14 @@ dependencies {
     // Robolectric: teste REAL do roundtrip PNG (Bitmap.compress/decode) em JVM.
     testImplementation("org.robolectric:robolectric:4.14.1")
     testImplementation("androidx.test:core:1.6.1")
+
+    // Testes instrumentados (androidTest): prova o buffer partilhado
+    // Kotlin↔C++ no dispositivo/emulador e a visibilidade do canvas.
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation(composeBom)
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
