@@ -89,8 +89,8 @@ class FileSystemProjectRepositoryTest {
 
         // O ficheiro anterior continua intacto e legível, com os píxeis originais
         val salvo = r.loadProject(projeto.id)!!
-        assertEquals(16, salvo.second.width)
-        assertEquals(0xFFFF0000.toInt(), salvo.second.get(0, 0))
+        assertEquals(16, salvo.document.width)
+        assertEquals(0xFFFF0000.toInt(), salvo.document.get(0, 0))
 
         // O diretório-obstáculo é removido pelo cleanup do repositório
         // (se não fosse, seria um ficheiro .tmp órfão — verificar limpo)

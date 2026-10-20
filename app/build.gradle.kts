@@ -28,8 +28,8 @@ android {
         // pronto para OpenGL ES 3.0 nas fases 3D futuras.
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-fase0"
+        versionCode = 2
+        versionName = "0.2.0-fases1-2"
     }
 
     signingConfigs {
@@ -68,6 +68,14 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        unitTests {
+            // Robolectric precisa dos recursos Android para testar o
+            // roundtrip PNG real (Bitmap.compress/BitmapFactory).
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
@@ -81,10 +89,17 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.navigation:navigation-compose:2.8.5")
+    // Fases 1+2: retenção de estado do editor (rotação/ciclo de vida) e
+    // corrotinas para IO (guardar/exportar fora do thread principal).
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     // Apenas APIs estáveis são usadas no código; ui-tooling só existe em debug.
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // Testes unitários da lógica existente (modelo de projeto e repositório).
+    // Testes unitários (motor 2D, histórico, persistência, spritesheet/atlas).
     testImplementation("junit:junit:4.13.2")
+    // Robolectric: teste REAL do roundtrip PNG (Bitmap.compress/decode) em JVM.
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core:1.6.1")
 }

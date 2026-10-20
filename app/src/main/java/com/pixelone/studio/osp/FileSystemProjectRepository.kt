@@ -96,13 +96,19 @@ class FileSystemProjectRepository(
         return project
     }
 
-    /** Devolve o projeto e o documento completo, ou null se não existir. */
-    fun loadProject(id: String): Pair<PixelProject, PixelDocument>? {
+    /** Devolve o projeto, o documento completo e a paleta, ou null se não existir. */
+    data class LoadedProjectData(
+        val project: PixelProject,
+        val document: PixelDocument,
+        val palette: List<String>?
+    )
+
+    fun loadProject(id: String): LoadedProjectData? {
         val file = projectFile(id) ?: return null
         if (!file.exists()) return null
         val loaded = OspCodec.load(file.inputStream().buffered())
         val project = loaded.manifest.toProject(id)
-        return project to loaded.document
+        return LoadedProjectData(project, loaded.document, loaded.manifest.palette)
     }
 
     /**
@@ -110,10 +116,15 @@ class FileSystemProjectRepository(
      * e só então substitui o ficheiro final. Devolve o projeto atualizado
      * (updatedAtEpochMs novo).
      *
+     * @param palette paleta opcional em hex ARGB (#AARRGGBB) para o manifesto.
      * @throws IOException em falha de escrita/validação (o ficheiro anterior
      *         permanece intacto).
      */
-    fun saveDocument(project: PixelProject, document: PixelDocument): PixelProject {
+    fun saveDocument(
+        project: PixelProject,
+        document: PixelDocument,
+        palette: List<String>? = null
+    ): PixelProject {
         require(project.id.isNotBlank()) { "id do projeto vazio" }
         val finalFile = File(projectsDir, "${project.id}.osp")
         val tmpFile = File(projectsDir, "${project.id}.osp.tmp")
@@ -124,7 +135,8 @@ class FileSystemProjectRepository(
             width = document.width,
             height = document.height,
             createdAtEpochMs = updated.createdAtEpochMs,
-            updatedAtEpochMs = updated.updatedAtEpochMs
+            updatedAtEpochMs = updated.updatedAtEpochMs,
+            palette = palette?.takeIf { it.isNotEmpty() }
         )
 
         try {
