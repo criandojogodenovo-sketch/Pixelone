@@ -3,12 +3,16 @@ package com.pixelone.studio.editor
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.unit.IntOffset
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
@@ -16,44 +20,75 @@ import androidx.lifecycle.viewModelScope
 import com.pixelone.studio.osp.FileSystemProjectRepository
 import com.pixelone.studio.osp.OspCodec
 import com.pixelone.studio.osp.OspManifest
+import com.pixelone.studio.perf.PerfLog
 import com.pixelone.studio.pixel.HistoryManager
+import com.pixelone.studio.pixel.NativeEngine
 import com.pixelone.studio.pixel.PixelDocument
 import com.pixelone.studio.pixel.PixelEngine
 import com.pixelone.studio.project.PixelProject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.IntBuffer
+import java.util.concurrent.Executors
+import kotlin.math.max
+import kotlin.math.min
 
 /**
- * Estado e lógica do editor de pixel art (Fase 1).
+ * Estado e lógica do editor de pixel art (Fase 1 + correções de
+ * performance/canvas/UX).
  *
- * REQUISITOS CUMPRIDOS:
- * - Sobrevive a rotações/recriações de Activity (ViewModel).
- * - AUTOSAVE no ON_STOP (interrupções do ciclo de vida): cópia do trabalho
- *   não guardado em filesDir/autosave, oferecida para restauro no regresso.
- * - NUNCA executa IO pesado no thread principal (corrotinas Dispatchers.IO).
- * - Sincronização documento→Bitmap: por píxel durante o traço (barato) e
- *   cópia completa no commit (garantia de consistência), nunca uma cópia
- *   completa por evento de toque.
+ * CORREÇÕES DE ARQUITETURA NESTA VERSÃO:
+ *
+ * 1. ESTADO OBSERVÁVEL (Problema 2 — canvas não aparecia):
+ *    [document] e [imageBitmap] são agora `mutableStateOf` — criar/abrir um
+ *    projeto notifica o Compose IMEDIATAMENTE (antes eram campos simples e
+ *    a gate `doc == null` do ecrã não recomposta de forma fiável).
+ *
+ * 2. TRAÇO EM LOTE + PREVIEW AO VIVO (Problema 1 — atraso de 3-5 s):
+ *    - Durante o gesto, os pontos são recolhidos e o traço é desenhado
+ *      como PREVIEW (carimbos no Canvas), SEM escrever no documento —
+ *      custo por evento de movimento é proporcional aos pontos, nunca ao
+ *      tamanho da imagem.
+ *    - No fim do gesto, o lote completo é enviado ao motor nativo (C++17
+ *      via JNI) em UMA chamada; sem lib nativa, fallback Kotlin idêntico.
+ *    - O resultado traz deltas esparsos + dirty rect → o bitmap de
+ *      apresentação é atualizado APENAS na região alterada com
+ *      [Bitmap.setPixels] (nunca uma cópia integral por traço, nunca
+ *      recriação do bitmap, nunca setPixel por píxel).
+ *
+ * 3. THREADS: TODAS as mutações do documento (traço/fill/undo/redo) correm
+ *    num executor serial dedicado (paralelismo 1 — sem concorrência entre
+ *    desenho, buffer, histórico e apresentação). As atualizações do bitmap
+ *    de apresentação são devolvidas à main thread. Snapshots para
+ *    guardar/exportar são tirados no executor (sem leituras rasgadas).
+ *
+ * 4. INSTRUMENTAÇÃO: tags PixelOnePerf/Touch, /JNI e /Render — dimensões,
+ *    pontos, píxeis alterados, dirty rect, durações e caminho
+ *    (nativo/fallback), UMA linha por operação lógica.
+ *
+ * MANTÉM-SE: autosave ON_STOP, .osp, PNG/spritesheet/atlas, undo/redo com
+ * orçamento de memória, câmera zoom/pan e identidade visual.
  */
 class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycleObserver {
 
     // ------------------------------------------------------------------
-    // Documento e renderização
+    // Documento e renderização — ESTADO OBSERVÁVEL pelo Compose
     // ------------------------------------------------------------------
 
-    var document: PixelDocument? = null
+    /** Documento ativo (fonte de verdade: PixelDocument.sharedBuffer). */
+    var document: PixelDocument? by mutableStateOf(null)
         private set
 
-    var project: PixelProject? = null
+    var project: PixelProject? by mutableStateOf(null)
         private set
 
-    /** Bitmap de renderização (espelho do documento para o Compose). */
-    var imageBitmap: ImageBitmap? = null
+    /** Bitmap de apresentação (cache visual — NUNCA segunda fonte de verdade). */
+    var imageBitmap: ImageBitmap? by mutableStateOf(null)
         private set
 
     private var bitmap: Bitmap? = null
@@ -62,6 +97,21 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     var frameVersion = mutableIntStateOf(0)
         private set
 
+    /** Geração do documento — invalida resultados de operações assíncronas antigas. */
+    private var generation = 0
+
+    /** Scratch buffers do motor (1 alocação por documento, reutilizados). */
+    private var strokeScratch: NativeEngine.Scratch? = null
+
+    // ------------------------------------------------------------------
+    // Executor serial de mutações do documento (traço/fill/undo/redo/snapshots)
+    // ------------------------------------------------------------------
+
+    private val mutationExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pixelone-doc-mutation")
+    }
+    private val mutationDispatcher = mutationExecutor.asCoroutineDispatcher()
+
     // ------------------------------------------------------------------
     // Ferramentas e cor
     // ------------------------------------------------------------------
@@ -69,6 +119,15 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     var tool = mutableStateOf(PixelEngine.Tool.PENCIL)
     var brushSize = mutableIntStateOf(1)
     var activeColor = mutableIntStateOf(DEFAULT_COLOR)
+    var secondaryColor = mutableIntStateOf(SECONDARY_DEFAULT)
+
+    /** Cor secundária: comportamento definido — troca com [swapColors]. */
+    fun swapColors() {
+        val a = activeColor.intValue
+        activeColor.intValue = secondaryColor.intValue
+        secondaryColor.intValue = a
+    }
+
     var fillTolerance = mutableIntStateOf(0)
     var showGrid = mutableStateOf(true)
     var gridThreshold = mutableIntStateOf(4)
@@ -77,17 +136,41 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     val palette = mutableStateOf(listOf(DEFAULT_COLOR))
 
     // ------------------------------------------------------------------
+    // Preview do traço ao vivo (não modifica o documento!)
+    // ------------------------------------------------------------------
+
+    /**
+     * Carimbos pendentes do traço em curso, desenhados por cima da imagem
+     * no Canvas. Ao confirmar, o lote vai ao motor nativo e o preview é
+     * limpo — os píxeis nunca são modificados duas vezes nem contaminam a
+     * exportação (que lê o documento diretamente).
+     */
+    class StrokePreview(
+        val color: Int,
+        val brushSize: Int,
+        val eraser: Boolean
+    ) {
+        val stampPoints = mutableStateListOf<IntOffset>()
+    }
+
+    var preview: StrokePreview? by mutableStateOf(null)
+        private set
+
+    private val rawPoints = ArrayList<Int>(64) // x,y intercalado (lote do gesto)
+    private var strokeStartNanos = 0L
+
+    // ------------------------------------------------------------------
     // Câmera (zoom/pan)
     // ------------------------------------------------------------------
 
     var scale = mutableFloatStateOf(1f)
     var offset = mutableStateOf(Offset.Zero)
 
-    /** Dimensão do viewport do canvas (para ajustar à vista). */
+    /** Dimensão do viewport do canvas (recebida via onSizeChanged — NUNCA no draw). */
     private var viewportWidth = 0f
     private var viewportHeight = 0f
 
-    /** Ajuste à vista pendente (documento novo/aberto, aguarda layout). */
+    /** Ajuste à vista pendente (documento novo/aberto, aguarda layout válido). */
     private var pendingFit = false
 
     // ------------------------------------------------------------------
@@ -116,14 +199,6 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
 
     private var statusJob: Job? = null
 
-    init {
-        // Regista-se no ciclo de vida via observador do ViewModelStoreOwner:
-        // o Compose chama setViewTreeLifecycleOwner na Activity, e o
-        // AndroidViewModel é observado através do processo abaixo.
-        // (O autosave também é acionado explicitamente antes de navegar para
-        // fora do editor e via onStopped do lifecycle owner da Activity.)
-    }
-
     /** Mensagem temporária para o utilizador (snackbar). */
     fun showMessage(message: String) {
         statusMessage.value = message
@@ -151,19 +226,29 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     fun autosaveIfNeeded() {
         val doc = document ?: return
         if (!hasUnsavedChanges.value || isBusy.value) return
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val manifest = OspManifest(
-                    name = project?.name ?: "sem-titulo",
-                    width = doc.width,
-                    height = doc.height,
-                    createdAtEpochMs = project?.createdAtEpochMs ?: System.currentTimeMillis(),
-                    updatedAtEpochMs = System.currentTimeMillis(),
-                    palette = palette.value.map { String.format("#%08X", it) }
-                )
-                OspCodec.save(manifest, doc, File(autosaveDir, AUTOSAVE_FILE).outputStream().buffered())
-            } catch (e: Exception) {
-                // Autosave é melhor-effort; nunca interrompe o utilizador.
+        viewModelScope.launch {
+            // Snapshot no executor de mutação (sem leitura rasgada do buffer).
+            val snapshot = withContext(mutationDispatcher) {
+                if (hasUnsavedChanges.value) doc.copyPixels() else null
+            } ?: return@launch
+            withContext(Dispatchers.IO) {
+                try {
+                    val manifest = OspManifest(
+                        name = project?.name ?: currentProjectName,
+                        width = doc.width,
+                        height = doc.height,
+                        createdAtEpochMs = project?.createdAtEpochMs ?: System.currentTimeMillis(),
+                        updatedAtEpochMs = System.currentTimeMillis(),
+                        palette = palette.value.map { String.format("#%08X", it) }
+                    )
+                    OspCodec.save(
+                        manifest,
+                        PixelDocument(doc.width, doc.height, snapshot),
+                        File(autosaveDir, AUTOSAVE_FILE).outputStream().buffered()
+                    )
+                } catch (e: Exception) {
+                    // Autosave é melhor-effort; nunca interrompe o utilizador.
+                }
             }
         }
     }
@@ -221,8 +306,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     // ------------------------------------------------------------------
 
     /**
-     * Cria um novo projeto (documento transparente). Não grava de imediato:
-     * grava no primeiro [saveProject] (que usa o nome indicado).
+     * Cria um novo projeto (documento transparente). O canvas aparece
+     * imediatamente: [document]/[imageBitmap] são estado Compose e o
+     * ajuste à vista ocorre quando o viewport tiver dimensões válidas.
      */
     fun newProject(name: String, width: Int, height: Int, onReady: () -> Unit) {
         autosaveIfNeeded()
@@ -302,30 +388,34 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     }
 
     /**
-     * Guarda no repositório interno. Se o projeto ainda não foi gravado,
-     * cria uma entrada nova com o nome atual.
+     * Guarda no repositório interno. Snapshot tirado no executor de
+     * mutação; a gravação (IO) usa o snapshot — nunca o buffer vivo.
      */
     fun saveProject(onDone: (Boolean) -> Unit) {
         val doc = document ?: return
         isBusy.value = true
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             try {
-                val current = project
-                val updated = if (current != null) {
-                    repository.saveDocument(
-                        current, doc,
-                        palette.value.map { String.format("#%08X", it) }
-                    )
-                } else {
-                    repository.createProject(
-                        name = currentProjectName.ifBlank { "sem-titulo" },
-                        width = doc.width,
-                        height = doc.height
-                    ).let { created ->
+                val snapshot = withContext(mutationDispatcher) { doc.copyPixels() }
+                val working = PixelDocument(doc.width, doc.height, snapshot)
+                val updated = withContext(Dispatchers.IO) {
+                    val current = project
+                    if (current != null) {
                         repository.saveDocument(
-                            created, doc,
+                            current, working,
                             palette.value.map { String.format("#%08X", it) }
                         )
+                    } else {
+                        repository.createProject(
+                            name = currentProjectName.ifBlank { "sem-titulo" },
+                            width = doc.width,
+                            height = doc.height
+                        ).let { created ->
+                            repository.saveDocument(
+                                created, working,
+                                palette.value.map { String.format("#%08X", it) }
+                            )
+                        }
                     }
                 }
                 withContext(Dispatchers.Main) {
@@ -347,27 +437,29 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
 
     /**
      * Guardar como: escreve uma CÓPIA no destino SAF escolhido pelo
-     * utilizador (não altera o projeto atual). O ficheiro é serializado
-     * integralmente em memória primeiro; uma falha a meio do stream é
-     * reportada e o .osp interno continua intacto.
+     * utilizador (não altera o projeto atual), a partir de um snapshot.
      */
     fun saveProjectAs(uri: android.net.Uri, onDone: (Boolean) -> Unit) {
         val doc = document ?: return
         isBusy.value = true
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             try {
-                val manifest = OspManifest(
-                    name = currentProjectName.ifBlank { "sem-titulo" },
-                    width = doc.width,
-                    height = doc.height,
-                    createdAtEpochMs = project?.createdAtEpochMs ?: System.currentTimeMillis(),
-                    updatedAtEpochMs = System.currentTimeMillis(),
-                    palette = palette.value.map { String.format("#%08X", it) }
-                )
-                val resolver = getApplication<Application>().contentResolver
-                resolver.openOutputStream(uri, "wt")?.use { out ->
-                    OspCodec.save(manifest, doc, out.buffered())
-                } ?: throw java.io.IOException("Não foi possível abrir o destino")
+                val snapshot = withContext(mutationDispatcher) { doc.copyPixels() }
+                val working = PixelDocument(doc.width, doc.height, snapshot)
+                withContext(Dispatchers.IO) {
+                    val manifest = OspManifest(
+                        name = currentProjectName.ifBlank { "sem-titulo" },
+                        width = doc.width,
+                        height = doc.height,
+                        createdAtEpochMs = project?.createdAtEpochMs ?: System.currentTimeMillis(),
+                        updatedAtEpochMs = System.currentTimeMillis(),
+                        palette = palette.value.map { String.format("#%08X", it) }
+                    )
+                    val resolver = getApplication<Application>().contentResolver
+                    resolver.openOutputStream(uri, "wt")?.use { out ->
+                        OspCodec.save(manifest, working, out.buffered())
+                    } ?: throw java.io.IOException("Não foi possível abrir o destino")
+                }
                 withContext(Dispatchers.Main) {
                     showMessage("Cópia guardada (Guardar como)")
                     onDone(true)
@@ -385,26 +477,30 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
 
     /**
      * Exporta a imagem atual como PNG para o URI SAF escolhido.
-     * Exporta APENAS os píxeis do documento (nunca grelha, quadriculado ou UI).
+     * Exporta APENAS os píxeis do documento (nunca grelha, quadriculado,
+     * preview do traço ou UI) — o snapshot é tirado no executor de mutação.
      */
     fun exportPng(uri: android.net.Uri, onDone: (Boolean) -> Unit) {
         val doc = document ?: return
         isBusy.value = true
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch {
             try {
-                // Não premultiplicado: os valores RGBA são escritos no PNG
-                // EXATAMENTE como estão no documento (pixel art exige bytes
-                // exatos, inclusive com alpha muito baixo).
-                val bmp = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
-                bmp.setPremultiplied(false)
-                bmp.copyPixelsFromBuffer(IntBuffer.wrap(doc.copyPixels()))
-                val resolver = getApplication<Application>().contentResolver
-                resolver.openOutputStream(uri, "wt")?.use { out ->
-                    if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, out.buffered())) {
-                        throw java.io.IOException("Falha ao codificar PNG")
-                    }
-                } ?: throw java.io.IOException("Não foi possível abrir o destino")
-                bmp.recycle()
+                val snapshot = withContext(mutationDispatcher) { doc.copyPixels() }
+                withContext(Dispatchers.IO) {
+                    // Não premultiplicado: os valores RGBA são escritos no PNG
+                    // EXATAMENTE como estão no documento (pixel art exige bytes
+                    // exatos, inclusive com alpha muito baixo).
+                    val bmp = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
+                    bmp.setPremultiplied(false)
+                    bmp.copyPixelsFromBuffer(IntBuffer.wrap(snapshot))
+                    val resolver = getApplication<Application>().contentResolver
+                    resolver.openOutputStream(uri, "wt")?.use { out ->
+                        if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, out.buffered())) {
+                            throw java.io.IOException("Falha ao codificar PNG")
+                        }
+                    } ?: throw java.io.IOException("Não foi possível abrir o destino")
+                    bmp.recycle()
+                }
                 withContext(Dispatchers.Main) {
                     showMessage("PNG exportado (${doc.width}x${doc.height})")
                     onDone(true)
@@ -421,99 +517,185 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     }
 
     // ------------------------------------------------------------------
-    // Desenho (chamado pelo PixelCanvas)
+    // Traço: preview ao vivo + lote único no fim do gesto
     // ------------------------------------------------------------------
 
-    /** Recorder composto: alimenta o histórico e sincroniza o Bitmap ao vivo. */
-    private inner class StrokeSync(
-        private val liveSync: Boolean
-    ) : PixelEngine.StrokeRecorder {
-        override fun onBeforeChange(x: Int, y: Int, beforeColor: Int) {
-            history.onBeforeChange(x, y, beforeColor)
-        }
+    /**
+     * Início do gesto (down). Recolhe o primeiro ponto e prepara o preview.
+     * NÃO escreve no documento.
+     */
+    fun beginStrokePreview(px: Int, py: Int) {
+        val d = document ?: return
+        if (!d.inBounds(px, py)) return
+        rawPoints.clear()
+        rawPoints.add(px)
+        rawPoints.add(py)
+        strokeStartNanos = System.nanoTime()
+        val eraser = tool.value == PixelEngine.Tool.ERASER
+        preview = StrokePreview(
+            color = if (eraser) 0x00000000 else activeColor.intValue,
+            brushSize = brushSize.intValue,
+            eraser = eraser
+        ).also { it.stampPoints.add(IntOffset(px, py)) }
+        PerfLog.i(TAG_TOUCH, "down píxel=($px,$py) docs=${d.width}x${d.height}")
+    }
 
-        override fun onChanged(x: Int, y: Int) {
-            history.onChanged(x, y)
-            if (liveSync) {
-                bitmap?.setPixel(x, y, document!!.get(x, y))
+    /**
+     * Movimento do dedo: interpola visualmente (Bresenham) os carimbos do
+     * preview entre o último ponto e o novo — o traço ao vivo não tem
+     * falhas mesmo com eventos de movimento espaçados.
+     */
+    fun continueStrokePreview(toX: Int, toY: Int) {
+        val d = document ?: return
+        val p = preview ?: return
+        if (!d.inBounds(toX, toY)) return
+        val last = rawPoints
+        if (last.size >= 2) {
+            val fromX = last[last.size - 2]
+            val fromY = last[last.size - 1]
+            appendBresenhamStamps(p, fromX, fromY, toX, toY)
+        }
+        rawPoints.add(toX)
+        rawPoints.add(toY)
+    }
+
+    /** Carimbos do preview (Bresenham — mesma geometria do motor). */
+    private fun appendBresenhamStamps(p: StrokePreview, x0: Int, y0: Int, x1: Int, y1: Int) {
+        val dx = Math.abs(x1 - x0)
+        val dy = -Math.abs(y1 - y0)
+        val stepX = if (x0 < x1) 1 else -1
+        val stepY = if (y0 < y1) 1 else -1
+        var err = dx + dy
+        var x = x0
+        var y = y0
+        while (true) {
+            if (x != x0 || y != y0) { // o primeiro ponto já está no preview
+                p.stampPoints.add(IntOffset(x, y))
             }
+            if (x == x1 && y == y1) break
+            val e2 = 2 * err
+            if (e2 >= dy) { err += dy; x += stepX }
+            if (e2 <= dx) { err += dx; y += stepY }
         }
     }
 
-    /** Inicia um traço com a ferramenta atual (down do dedo). */
-    fun beginDraw(px: Int, py: Int) {
-        val doc = document ?: return
-        history.beginStroke()
-        val sync = StrokeSync(liveSync = true)
-        when (tool.value) {
-            PixelEngine.Tool.PENCIL -> PixelEngine.drawPixel(doc, px, py, activeColor.value, brushSize.value, sync)
-            PixelEngine.Tool.ERASER -> PixelEngine.drawPixel(doc, px, py, 0x00000000, brushSize.value, sync)
-            else -> Unit // fill/eyedropper agem no fim do toque
-        }
-        afterEditVisual()
-    }
-
-    /** Continua o traço (movimento do dedo) — linha contínua desde o último ponto. */
-    fun continueDraw(fromX: Int, fromY: Int, toX: Int, toY: Int) {
-        val doc = document ?: return
-        val sync = StrokeSync(liveSync = true)
-        when (tool.value) {
-            PixelEngine.Tool.PENCIL -> PixelEngine.drawLine(doc, fromX, fromY, toX, toY, activeColor.value, brushSize.value, sync)
-            PixelEngine.Tool.ERASER -> PixelEngine.drawLine(doc, fromX, fromY, toX, toY, 0x00000000, brushSize.value, sync)
-            else -> Unit
-        }
-        afterEditVisual()
-    }
-
-    /** Termina o traço (up do dedo) — UMA entrada de histórico. */
-    fun endDraw() {
-        val doc = document ?: return
-        history.commitStroke(doc)
-        afterEditFull()
-    }
-
-    /** Cancela o traço em curso (segundo dedo entrou). */
-    fun cancelDraw() {
-        val doc = document ?: return
-        history.cancelStroke(doc)
-        afterEditFull()
-    }
-
-    /** Ferramentas de toque único (fill / conta-gotas), agem no fim do toque. */
-    fun tapTool(px: Int, py: Int) {
-        val doc = document ?: return
-        when (tool.value) {
-            PixelEngine.Tool.FILL -> {
-                history.beginStroke()
-                PixelEngine.floodFill(doc, px, py, activeColor.value, fillTolerance.value, StrokeSync(liveSync = false))
-                history.commitStroke(doc)
-                afterEditFull()
-            }
-            PixelEngine.Tool.EYEDROPPER -> {
-                val picked = PixelEngine.pickColor(doc, px, py)
-                if (doc.inBounds(px, py)) {
-                    activeColor.value = picked
-                    addColorToPalette(picked)
-                    showMessage("Cor obtida")
+    /**
+     * Fim do gesto: envia o LOTE COMPLETO ao motor nativo em UMA chamada
+     * (executor de mutação), commita os deltas no histórico e atualiza o
+     * bitmap de apresentação APENAS na região suja. O gesto continua a ter
+     * feedback visual (preview) durante todo o traço.
+     */
+    fun commitStroke() {
+        val p = preview ?: return
+        preview = null
+        val d = document ?: return
+        val gen = generation
+        val points = rawPoints.toIntArray()
+        val pointCount = points.size / 2
+        val scratch = strokeScratch
+        val gestureMs = (System.nanoTime() - strokeStartNanos) / 1_000_000.0
+        rawPoints.clear()
+        if (pointCount < 1 || scratch == null) return
+        PerfLog.i(TAG_TOUCH, "traço completo pontos=$pointCount gesto=$gestureMs ms")
+        viewModelScope.launch(mutationDispatcher) {
+            val result = NativeEngine.strokeBatch(d, points, pointCount, p.color, p.brushSize, scratch)
+            withContext(Dispatchers.Main) {
+                if (gen != generation) return@withContext // documento trocado entretanto
+                if (result != null && result.changedSomething) {
+                    history.commitDeltas(
+                        scratch.indices, scratch.before, scratch.after, result.deltaCount,
+                        result.dirtyX0, result.dirtyY0, result.dirtyX1, result.dirtyY1
+                    )
+                    updateBitmapRegion(
+                        result.dirtyX0, result.dirtyY0, result.dirtyX1, result.dirtyY1
+                    )
+                    hasUnsavedChanges.value = true
                 }
             }
+        }
+    }
+
+    /** Cancela o gesto (2.º dedo entrou): limpa o preview — nada foi escrito. */
+    fun cancelStroke() {
+        preview = null
+        rawPoints.clear()
+    }
+
+    // ------------------------------------------------------------------
+    // Ferramentas de toque único (fill / conta-gotas)
+    // ------------------------------------------------------------------
+
+    fun tapTool(px: Int, py: Int) {
+        val d = document ?: return
+        when (tool.value) {
+            PixelEngine.Tool.FILL -> {
+                if (!d.inBounds(px, py)) return
+                if (d.get(px, py) == activeColor.intValue) return // no-op
+                val gen = generation
+                val scratch = strokeScratch ?: return
+                viewModelScope.launch(mutationDispatcher) {
+                    val result = NativeEngine.floodFill(
+                        d, px, py, activeColor.intValue, fillTolerance.intValue, scratch
+                    )
+                    withContext(Dispatchers.Main) {
+                        if (gen != generation) return@withContext
+                        if (result != null && result.changedSomething) {
+                            history.commitDeltas(
+                                scratch.indices, scratch.before, scratch.after, result.deltaCount,
+                                result.dirtyX0, result.dirtyY0, result.dirtyX1, result.dirtyY1
+                            )
+                            updateBitmapRegion(
+                                result.dirtyX0, result.dirtyY0, result.dirtyX1, result.dirtyY1
+                            )
+                            hasUnsavedChanges.value = true
+                        }
+                    }
+                }
+            }
+            PixelEngine.Tool.EYEDROPPER -> {
+                if (!d.inBounds(px, py)) return
+                val picked = PixelEngine.pickColor(d, px, py)
+                activeColor.intValue = picked
+                addColorToPalette(picked)
+                showMessage("Cor obtida")
+            }
             else -> Unit
         }
     }
 
+    // ------------------------------------------------------------------
+    // Undo / redo — aplica deltas no executor, atualiza bitmap regionalmente
+    // ------------------------------------------------------------------
+
     fun undo() {
-        val doc = document ?: return
-        if (history.undo(doc)) {
-            afterEditFull()
-            showMessage("Desfeito")
+        val d = document ?: return
+        val gen = generation
+        viewModelScope.launch(mutationDispatcher) {
+            val start = System.nanoTime()
+            val edit = history.undo(d) ?: return@launch
+            val ms = (System.nanoTime() - start) / 1_000_000.0
+            PerfLog.i(TAG_RENDER, "undo deltas=${edit.size} aplicar=$ms ms")
+            withContext(Dispatchers.Main) {
+                if (gen != generation) return@withContext
+                updateBitmapRegion(edit.minX, edit.minY, edit.maxX, edit.maxY)
+                showMessage("Desfeito")
+            }
         }
     }
 
     fun redo() {
-        val doc = document ?: return
-        if (history.redo(doc)) {
-            afterEditFull()
-            showMessage("Refeito")
+        val d = document ?: return
+        val gen = generation
+        viewModelScope.launch(mutationDispatcher) {
+            val start = System.nanoTime()
+            val edit = history.redo(d) ?: return@launch
+            val ms = (System.nanoTime() - start) / 1_000_000.0
+            PerfLog.i(TAG_RENDER, "redo deltas=${edit.size} aplicar=$ms ms")
+            withContext(Dispatchers.Main) {
+                if (gen != generation) return@withContext
+                updateBitmapRegion(edit.minX, edit.minY, edit.maxX, edit.maxY)
+                showMessage("Refeito")
+            }
         }
     }
 
@@ -529,15 +711,21 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
         hasUnsavedChanges.value = true
     }
 
+    /** Toque longo numa amostra da paleta define a cor SECUNDÁRIA. */
+    fun setSecondaryColor(color: Int) {
+        secondaryColor.intValue = color
+        showMessage("Cor secundária definida")
+    }
+
     // ------------------------------------------------------------------
-    // Câmera
+    // Câmera — viewport recebido via onSizeChanged (NUNCA durante o draw)
     // ------------------------------------------------------------------
 
     fun updateViewport(width: Float, height: Float) {
-        val firstLayout = viewportWidth <= 0f && width > 0f
+        val firstValid = viewportWidth <= 0f && width > 0f && height > 0f
         viewportWidth = width
         viewportHeight = height
-        if (pendingFit || firstLayout) {
+        if ((pendingFit || firstValid) && width > 0f && height > 0f && document != null) {
             fitToScreen()
             pendingFit = false
         }
@@ -568,7 +756,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
         offset.value = offset.value + pan
     }
 
-    /** Ajusta o documento inteiro à vista (com margem de 24px). */
+    /** Ajusta o documento inteiro à vista (com margem de 24px), centrado. */
     fun fitToScreen() {
         val doc = document ?: return
         if (viewportWidth <= 0f || viewportHeight <= 0f) return
@@ -583,11 +771,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
         )
     }
 
-    /** Zoom para 1 píxel da imagem = 1 dp do ecrã? Não: 1:1 real (px físico aproximado). */
+    /** Zoom 1:1 (1 píxel da imagem = 1 dp real do ecrã), centrado. */
     fun zoomTo100() {
         val doc = document ?: return
         scale.value = 1f.coerceIn(MIN_SCALE, MAX_SCALE)
-        // Centra
         if (viewportWidth > 0f) {
             offset.value = Offset(
                 (viewportWidth - doc.width * scale.value) / 2f,
@@ -602,45 +789,66 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
 
     private var currentProjectName: String = "sem-titulo"
 
-    private fun installProjectName(name: String) {
-        currentProjectName = name
-    }
-
     val projectName: String
         get() = project?.name ?: currentProjectName
 
+    /**
+     * Instala um documento (novo/aberto/importado/restaurado):
+     * - cria a cache visual UMA vez (nunca por toque/frame);
+     * - limpa o histórico e os scratch;
+     * - marca ajuste à vista pendente e tenta aplicá-lo já (se o viewport
+     *   é válido) — senão, aplica quando o layout chegar ([updateViewport]).
+     */
     private fun installDocument(
         doc: PixelDocument,
         project: PixelProject?,
         palette: List<Int>,
         projectName: String = project?.name ?: this.currentProjectName
     ) {
+        generation++
         this.document = doc
         this.project = project
         this.currentProjectName = projectName
         this.palette.value = palette.take(MAX_PALETTE)
         history.clear()
+        preview = null
+        rawPoints.clear()
+        strokeScratch = NativeEngine.Scratch(doc.pixelCount)
         bitmap?.recycle()
         val bmp = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
-        bmp.copyPixelsFromBuffer(IntBuffer.wrap(doc.pixelsView()))
+        bmp.copyPixelsFromBuffer(IntBuffer.wrap(doc.copyPixels()))
         bitmap = bmp
         imageBitmap = bmp.asImageBitmap()
         hasUnsavedChanges.value = false
         frameVersion.intValue++
         pendingFit = true
-        fitToScreen()
+        fitToScreen() // aplica já se o viewport já é válido
     }
 
-    private fun afterEditVisual() {
+    /**
+     * ATUALIZAÇÃO REGIONAL do bitmap de apresentação: copia apenas o
+     * retângulo sujo do buffer direto e aplica com [Bitmap.setPixels].
+     * - nunca uma cópia integral por evento;
+     * - nunca recria o Bitmap;
+     * - não toca na imagem quando nenhum píxel mudou (chamadores verificam).
+     */
+    private fun updateBitmapRegion(x0: Int, y0: Int, x1: Int, y1: Int) {
+        val bmp = bitmap ?: return
+        val d = document ?: return
+        val rx0 = max(0, min(x0, x1))
+        val ry0 = max(0, min(y0, y1))
+        val rx1 = min(d.width - 1, max(x0, x1))
+        val ry1 = min(d.height - 1, max(y0, y1))
+        if (rx0 > rx1 || ry0 > ry1) return
+        val start = System.nanoTime()
+        val rw = rx1 - rx0 + 1
+        val rh = ry1 - ry0 + 1
+        val region = IntArray(rw * rh) // proporcional à REGIÃO, não ao documento
+        d.copyRegionInto(rx0, ry0, rw, rh, region)
+        bmp.setPixels(region, 0, rw, rx0, ry0, rw, rh)
         frameVersion.intValue++
-        hasUnsavedChanges.value = true
-    }
-
-    private fun afterEditFull() {
-        val doc = document ?: return
-        bitmap?.copyPixelsFromBuffer(IntBuffer.wrap(doc.pixelsView()))
-        frameVersion.intValue++
-        hasUnsavedChanges.value = true
+        val ms = (System.nanoTime() - start) / 1_000_000.0
+        PerfLog.i(TAG_RENDER, "região ${rw}x${rh} em ($rx0,$ry0) atualizar=$ms ms")
     }
 
     private fun parseHexColor(hex: String): Int? = try {
@@ -649,12 +857,21 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
         null
     }
 
+    override fun onCleared() {
+        mutationDispatcher.close()
+        super.onCleared()
+    }
+
     companion object {
         const val DEFAULT_COLOR: Int = 0xFFF57C00.toInt() // laranja Pixel One
+        const val SECONDARY_DEFAULT: Int = 0xFF212121.toInt()
         const val MIN_SCALE: Float = 0.05f
         const val MAX_SCALE: Float = 64f
         const val MAX_PALETTE: Int = 24
         const val AUTOSAVE_FILE: String = "autosave.osp"
         const val AUTOSAVE_NAME: String = "autosave"
+
+        private const val TAG_TOUCH = "PixelOnePerf/Touch"
+        private const val TAG_RENDER = "PixelOnePerf/Render"
     }
 }
