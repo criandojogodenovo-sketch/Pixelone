@@ -35,12 +35,14 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
+import com.pixelone.studio.export.PngExport
 import com.pixelone.studio.pixel.PixelDocument
 import kotlin.math.roundToInt
 
 /**
- * Diálogos do editor (Fase 1): novo projeto, seletor de cores RGBA e
- * confirmação de descarte de alterações.
+ * Diálogos do editor (Fase 1): novo projeto, seletor de cores RGBA,
+ * confirmação de descarte de alterações e opções de exportação PNG
+ * (escala 1x–16x + fundo transparente/preto).
  */
 
 // ---------------------------------------------------------------------------
@@ -349,6 +351,119 @@ fun parseHex(text: String): Int? = try {
     }
 } catch (e: Exception) {
     null
+}
+
+// ---------------------------------------------------------------------------
+// Opções de exportação PNG (escala + fundo)
+// ---------------------------------------------------------------------------
+
+/**
+ * Diálogo de opções da exportação PNG:
+ *
+ *  - ESCALA: 1x, 2x, 4x, 8x, 16x — o bitmap ORIGINAL nasce com a largura
+ *    e altura REAIS do canvas e o FINAL é `Bitmap.createScaledBitmap(
+ *    original, w*escala, h*escala, false)`; o `false` (filter) desliga a
+ *    suavização e mantém os píxeis nítidos (nearest-neighbor).
+ *  - FUNDO: transparente (alfa preservado) ou preto sólido, preenchido
+ *    com `canvas.drawColor` antes de desenhar.
+ *  - A pré-visualização mostra as dimensões finais; se a escala exceder
+ *    os limites de memória [PngExport.MAX_SCALED_SIDE] /
+ *    [PngExport.MAX_SCALED_PIXELS], a exportação é bloqueada com aviso
+ *    (evita OOM) em vez de falhar depois com erro.
+ */
+@Composable
+fun ExportOptionsDialog(
+    canvasWidth: Int,
+    canvasHeight: Int,
+    onDismiss: () -> Unit,
+    onExport: (scale: PngExport.ScaleOption, background: PngExport.BackgroundOption) -> Unit
+) {
+    var scaleIndex by rememberSaveable { mutableIntStateOf(0) }
+    var backgroundIndex by rememberSaveable { mutableIntStateOf(0) }
+
+    val scale = PngExport.ScaleOption.entries[scaleIndex]
+    val background = PngExport.BackgroundOption.entries[backgroundIndex]
+
+    val outW = canvasWidth.toLong() * scale.factor
+    val outH = canvasHeight.toLong() * scale.factor
+    val exceedsLimits = outW > PngExport.MAX_SCALED_SIDE ||
+        outH > PngExport.MAX_SCALED_SIDE ||
+        outW * outH > PngExport.MAX_SCALED_PIXELS
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Exportar PNG") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Escala (píxeis nítidos, sem suavização)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    PngExport.ScaleOption.entries.forEach { option ->
+                        val selected = option == scale
+                        TextButton(onClick = { scaleIndex = option.ordinal }) {
+                            Text(
+                                option.label,
+                                color = if (selected) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Text(
+                    "Fundo",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(onClick = { backgroundIndex = 0 }) {
+                        Text(
+                            "Transparente",
+                            color = if (background == PngExport.BackgroundOption.TRANSPARENT)
+                                MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    TextButton(onClick = { backgroundIndex = 1 }) {
+                        Text(
+                            "Preto",
+                            color = if (background == PngExport.BackgroundOption.SOLID_BLACK)
+                                MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Text(
+                    "Saída: $canvasWidth×$canvasHeight → ${outW}×${outH} px",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (exceedsLimits) {
+                    Text(
+                        "Esta escala ultrapassa o limite de " +
+                            "${PngExport.MAX_SCALED_SIDE} px por lado / " +
+                            "${PngExport.MAX_SCALED_PIXELS} píxeis. Escolhe uma escala menor.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !exceedsLimits,
+                onClick = { onExport(scale, background) }
+            ) { Text("Exportar") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancelar") }
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------

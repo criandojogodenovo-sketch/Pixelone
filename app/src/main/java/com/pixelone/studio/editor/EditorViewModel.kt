@@ -489,6 +489,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
      *
      * Exporta APENAS os píxeis do documento (nunca grelha, quadriculado,
      * preview do traço ou UI) — o snapshot é tirado no executor de mutação.
+     * Aceita escala (1x–16x, nearest-neighbor) e fundo (transparente/preto).
      *
      * CORREÇÕES vs. versão anterior (bug do ficheiro 0 bytes):
      * - SEM retorno silencioso: sem documento aberto avisa com Toast e
@@ -498,7 +499,12 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
      * - usa o mesmo núcleo testável [PngExport.buildBitmapFromDocument]
      *   (bitmap verificado: não nulo, não reciclado, píxeis exatos).
      */
-    fun exportPng(uri: Uri, onDone: (Boolean) -> Unit) {
+    fun exportPng(
+        uri: Uri,
+        scale: PngExport.ScaleOption = PngExport.ScaleOption.X1,
+        background: PngExport.BackgroundOption = PngExport.BackgroundOption.TRANSPARENT,
+        onDone: (Boolean) -> Unit
+    ) {
         val doc = document
         if (doc == null) {
             // O seletor SAF criou o ficheiro vazio ao confirmar; removê-lo
@@ -511,7 +517,11 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
         isBusy.value = true
         viewModelScope.launch {
             try {
-                val bmp = withContext(mutationDispatcher) { PngExport.buildBitmapFromDocument(doc) }
+                val bmp = withContext(mutationDispatcher) {
+                    PngExport.buildBitmapFromDocument(doc, scale, background)
+                }
+                val finalW = bmp.width
+                val finalH = bmp.height
                 try {
                     withContext(Dispatchers.IO) {
                         val resolver = getApplication<Application>().contentResolver
@@ -525,7 +535,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
                     bmp.recycle()
                 }
                 withContext(Dispatchers.Main) {
-                    showMessage("PNG exportado (${doc.width}x${doc.height})")
+                    showMessage("PNG exportado (${finalW}x${finalH})")
                     onDone(true)
                 }
             } catch (e: Exception) {
@@ -554,16 +564,23 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
      *  1) Bitmap ARGB_8888 com a largura/altura REAIS da tela de pixel
      *     art, píxeis copiados do buffer C++ (buffer direto partilhado
      *     Kotlin↔C++); bitmap verificado: não nulo, não reciclado.
+     *     ACEITA ESCALA (1x/2x/4x/8x/16x, nearest-neighbor — filter=false,
+     *     píxeis nítidos) e FUNDO (transparente ou preto sólido preenchido
+     *     com canvas.drawColor antes de desenhar).
      *  2) ContentValues: DISPLAY_NAME (único), MIME_TYPE=image/png,
      *     RELATIVE_PATH=Download/, IS_PENDING=1.
      *  3) contentResolver.openOutputStream(uri) → `val ok =
      *     bitmap.compress(PNG, 100, out)` → out.flush() → close (use{}).
      *  4) IS_PENDING=0 — o ficheiro só se torna visível com conteúdo.
-     *  5) Toast de sucesso com ok=true e o tamanho real em bytes.
+     *  5) Toast de sucesso com ok=true, LARGURA×ALTURA FINAIS e o tamanho
+     *     real em bytes.
      *  6) Qualquer exceção: Toast com e.message (ok=false) e REMOÇÃO da
      *     entrada pendente — nunca fica um ficheiro 0 bytes em Download/.
      */
-    fun exportPngToDownloads() {
+    fun exportPngToDownloads(
+        scale: PngExport.ScaleOption = PngExport.ScaleOption.X1,
+        background: PngExport.BackgroundOption = PngExport.BackgroundOption.TRANSPARENT
+    ) {
         val doc = document
         if (doc == null) {
             toast("Falha ao exportar PNG: não há projeto aberto (ok=false)")
@@ -575,9 +592,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
             var pendingUri: Uri? = null
             try {
                 // 1) Bitmap verificado a partir do buffer partilhado C++/Kotlin
+                //    (original w×h real → final w*escala × h*escala)
                 val bmp = withContext(mutationDispatcher) {
-                    PngExport.buildBitmapFromDocument(doc)
+                    PngExport.buildBitmapFromDocument(doc, scale, background)
                 }
+                // Dimensões FINAIS capturadas antes do recycle (para o Toast)
+                val finalW = bmp.width
+                val finalH = bmp.height
                 try {
                     withContext(Dispatchers.IO) {
                         val resolver = getApplication<Application>().contentResolver
@@ -623,13 +644,17 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
                         PerfLog.i(
                             TAG_EXPORT,
                             "PNG Download/ docs=${doc.width}x${doc.height} " +
+                                "escala=${scale.factor}x " +
+                                "fundo=${background.name.lowercase()} " +
+                                "final=${finalW}x${finalH} " +
                                 "bytes=${result.bytes} codificar=$ms ms"
                         )
-                        // 5) Toast obrigatório: ok + tamanho real em bytes
+                        // 5) Toast obrigatório: ok + largura×altura + bytes reais
                         withContext(Dispatchers.Main.immediate) {
                             toast(
                                 "PNG exportado: Download/$finalName — " +
-                                    "ok=${result.ok}, ${result.bytes} bytes"
+                                    "ok=${result.ok}, ${finalW}x${finalH} px, " +
+                                    "${result.bytes} bytes"
                             )
                         }
                     }

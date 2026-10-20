@@ -2,6 +2,9 @@ package com.pixelone.studio.export
 
 import android.content.ContentValues
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
 import android.os.Build
 import android.provider.MediaStore
 import com.pixelone.studio.pixel.PixelDocument
@@ -48,6 +51,87 @@ object PngExport {
     data class WriteResult(val ok: Boolean, val bytes: Long)
 
     // ------------------------------------------------------------------
+    // 0) Escala e fundo — opções da exportação PNG
+    // ------------------------------------------------------------------
+
+    /**
+     * Fatores de escala pedidos: 1x, 2x, 4x, 8x e 16x. O escalonamento é
+     * SEMPRE nearest-neighbor (sem suavização): o `filter=false` de
+     * [Bitmap.createScaledBitmap] e o `isFilterBitmap=false` do Paint
+     * mantêm cada píxel como um bloco nítido de N×N — nunca um borrão
+     * interpolado.
+     */
+    enum class ScaleOption(val factor: Int) {
+        X1(1), X2(2), X4(4), X8(8), X16(16);
+
+        /** Rótulo curto para a UI (ex.: "4x"). */
+        val label: String get() = "${factor}x"
+    }
+
+    /**
+     * Fundo do PNG exportado:
+     *  - [TRANSPARENT] preserva o alfa do documento (padrão; igual ao
+     *    comportamento anterior);
+     *  - [SOLID_BLACK] achata a arte sobre preto sólido 0xFF000000 — o
+     *    bitmap final é PREENCHIDO com `canvas.drawColor` ANTES de
+     *    desenhar (receita exata do pedido).
+     */
+    enum class BackgroundOption { TRANSPARENT, SOLID_BLACK }
+
+    /**
+     * Lado máximo do bitmap final. O Android impõe ~32 767 por eixo;
+     * fica-se por 16 384 — mais do que suficiente para qualquer export
+     * de pixel art e longe dos limites do framework.
+     */
+    const val MAX_SCALED_SIDE: Int = 16_384
+
+    /**
+     * Máximo de píxeis do bitmap final: 32 MP ≈ 128 MB em ARGB_8888.
+     * Proteção anti-OOM: uma tela 2048×2048 a 16x geraria 32 768×32 768
+     * (~4 GB) — rejeitado AQUI, com mensagem clara no Toast, em vez de
+     * deixar a app morrer com OutOfMemoryError (que nem é capturável
+     * pelo `catch (Exception)` do ViewModel).
+     */
+    const val MAX_SCALED_PIXELS: Long = 33_554_432L
+
+    /**
+     * Valida as dimensões escaladas ANTES de qualquer alocação. Lança
+     * [IllegalStateException] com mensagem pronta para o Toast quando a
+     * escala pedida excede [MAX_SCALED_SIDE] ou [MAX_SCALED_PIXELS].
+     */
+    fun validateScaledDimensions(width: Int, height: Int, scale: Int) {
+        require(width >= 1 && height >= 1) {
+            "Dimensões do canvas inválidas: ${width}x${height}"
+        }
+        require(scale >= 1) { "Escala inválida: $scale" }
+        val sw = width.toLong() * scale
+        val sh = height.toLong() * scale
+        if (sw > MAX_SCALED_SIDE || sh > MAX_SCALED_SIDE) {
+            throw IllegalStateException(
+                "Escala ${scale}x gera ${sw}x${sh} px — o lado máximo é " +
+                    "$MAX_SCALED_SIDE. Escolhe uma escala menor."
+            )
+        }
+        if (sw * sh > MAX_SCALED_PIXELS) {
+            throw IllegalStateException(
+                "Escala ${scale}x gera ${sw}x${sh} px (${sw * sh} píxeis) — " +
+                    "o máximo é $MAX_SCALED_PIXELS píxeis (~32 MP). Escolhe uma escala menor."
+            )
+        }
+    }
+
+    /**
+     * Paint da alternativa prescrita para desenhar a escala: suavização
+     * DESLIGADA nos dois interruptores — `isFilterBitmap=false` (sem
+     * filtragem bilinear: cada píxel da origem vira um bloco nítido) e
+     * `isAntiAlias=false` (sem bordas semi-transparentes nas arestas).
+     */
+    fun nearestNeighborPaint(): Paint = Paint().apply {
+        isFilterBitmap = false
+        isAntiAlias = false
+    }
+
+    // ------------------------------------------------------------------
     // 1) Bitmap a partir do buffer partilhado Kotlin↔C++
     // ------------------------------------------------------------------
 
@@ -89,6 +173,112 @@ object PngExport {
         bmp.setPremultiplied(false)
         bmp.setPixels(pixels, 0, doc.width, 0, 0, doc.width, doc.height)
         return bmp
+    }
+
+    /**
+     * Exportação com ESCALA e FUNDO escolhidos (novidade): constrói o
+     * bitmap ORIGINAL com as dimensões reais do canvas (via
+     * [buildBitmapFromDocument] — píxeis exatos do buffer partilhado
+     * Kotlin↔C++) e produz o bitmap FINAL escalado, sempre em
+     * nearest-neighbor:
+     *
+     *  - [ScaleOption.X1] + [BackgroundOption.TRANSPARENT] devolve o
+     *    bitmap original SEM nenhum passo de desenho — caminho 1:1 com o
+     *    buffer (comportamento anterior, byte-exato, incl. alpha baixo).
+     *
+     *  - TRANSPARENT com escala > 1: `Bitmap.createScaledBitmap(original,
+     *    w*escala, h*escala, false)` — o `false` (filter) desliga a
+     *    suavização e mantém os píxeis nítidos.
+     *
+     *  - [BackgroundOption.SOLID_BLACK]: o bitmap final é criado vazio,
+     *    PREENCHIDO com `canvas.drawColor(preto)` ANTES de desenhar e a
+     *    arte é desenhada por cima com `Canvas.drawBitmap` e um Paint de
+     *    [nearestNeighborPaint] (isFilterBitmap=false, isAntiAlias=false)
+     *    — a alternativa prevista no pedido, necessária aqui porque o
+     *    fundo tem de ser pintado antes da arte.
+     *
+     * PRECISÃO: no caminho 1x transparente os bytes são EXATOS (setPixels
+     * direto, sem composição). Em escalas > 1 o desenho passa pelo espaço
+     * premultiplicado do Skia — píxeis opacos e totalmente transparentes
+     * permanecem exatos (o padrão da pixel art); alfas MUITO baixos
+     * (≤ ~7/255) podem sofrer arredondamento de 1 bit nos RGB, limitação
+     * conhecida do pipeline gráfico do Android.
+     *
+     * @throws IllegalStateException se as dimensões escaladas excederem
+     *         os limites ([validateScaledDimensions]) ou se algum bitmap
+     *         nascer null/reciclado — nunca devolve um bitmap sem
+     *         condições para ser comprimido. O bitmap ORIGINAL usado como
+     *         origem é reciclado antes de devolver (só o final sobrevive).
+     */
+    fun buildBitmapFromDocument(
+        doc: PixelDocument,
+        scale: ScaleOption,
+        background: BackgroundOption
+    ): Bitmap {
+        val original = buildBitmapFromDocument(doc)
+        val s = scale.factor
+        if (s == 1 && background == BackgroundOption.TRANSPARENT) {
+            return original // caminho exato: igual ao comportamento anterior
+        }
+        try {
+            validateScaledDimensions(doc.width, doc.height, s)
+            val sw = doc.width * s
+            val sh = doc.height * s
+
+            val final: Bitmap = if (background == BackgroundOption.SOLID_BLACK) {
+                // Fundo sólido: bitmap final novo → drawColor(preto) ANTES
+                // de desenhar → arte por cima com nearest-neighbor.
+                val out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
+                    ?: throw IllegalStateException(
+                        "Bitmap.createBitmap devolveu null (${sw}x${sh})"
+                    )
+                if (out.isRecycled) {
+                    throw IllegalStateException("Bitmap de fundo foi reciclado")
+                }
+                // Destino totalmente opaco (preto + arte) — valores retos,
+                // sem premultiplicação, mantêm as cores byte-exatas.
+                out.setPremultiplied(false)
+                val canvas = Canvas(out)
+                // 1º PREENCHER o fundo (antes de desenhar a arte — receita)
+                canvas.drawColor(android.graphics.Color.BLACK)
+                // 2º desenhar a arte escalada, sem suavização nem anti-alias
+                val paint = nearestNeighborPaint()
+                val dst = RectF(0f, 0f, sw.toFloat(), sh.toFloat())
+                canvas.drawBitmap(original, null, dst, paint)
+                out
+            } else {
+                // Fundo transparente: createScaledBitmap com filter=false —
+                // nearest-neighbor puro, alfa da arte preservado.
+                val scaled = Bitmap.createScaledBitmap(original, sw, sh, false)
+                    ?: throw IllegalStateException(
+                        "createScaledBitmap devolveu null " +
+                            "(${doc.width}x${doc.height} → ${sw}x${sh})"
+                    )
+                if (scaled.isRecycled) {
+                    throw IllegalStateException("Bitmap escalado foi reciclado")
+                }
+                // Sanity: as dimensões finais têm de ser exatamente w*s × h*s
+                check(scaled.width == sw && scaled.height == sh) {
+                    "Bitmap escalado tem ${scaled.width}x${scaled.height}; " +
+                        "esperado ${sw}x${sh}"
+                }
+                scaled
+            }
+
+            // Verificação final: nunca devolver um bitmap sem condições
+            if (final.isRecycled || final.width != sw || final.height != sh) {
+                throw IllegalStateException(
+                    "Bitmap final inválido: ${final.width}x${final.height}, " +
+                        "reciclado=${final.isRecycled} (esperado ${sw}x${sh})"
+                )
+            }
+            return final
+        } finally {
+            // A origem já não é necessária — o chamador só recebe o final.
+            if (s != 1 || background != BackgroundOption.TRANSPARENT) {
+                original.recycle()
+            }
+        }
     }
 
     // ------------------------------------------------------------------
