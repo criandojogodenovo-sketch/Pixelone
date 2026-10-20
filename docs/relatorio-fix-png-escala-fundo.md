@@ -82,15 +82,32 @@ verificado: não nulo, não reciclado, dimensões exatamente `w*s × h*s`.
 - Fundo preto: alfa do resultado é sempre 255; semi-transparências são achatadas
   sobre o preto (canal × alfa), que é o resultado visual correto de "flatten".
 
-### Descoberta do CI (corrigida no mesmo branch)
+### Descobertas do CI (corrigidas no mesmo branch)
 
-A primeira submissão desenhava o fundo preto num destino `setPremultiplied(false)`.
-O CI falhou com `RuntimeException` nos 2 testes de fundo preto — e o motivo é
-estrutural, não só do Robolectric: **o Skia não aceita superfícies de Canvas com
-alphaType `kUnpremul`** (`SkSurfaces::Raster` devolve null → exceção), também em
-dispositivo. Correção: o destino do desenho mantém-se PREMULTIPLICADO (padrão).
-Como o resultado do fundo preto é 100% opaco (preto + arte), premul e reto
-coincidem byte a byte e o PNG sai exato; os testes passaram a validar isso.
+Duas limitações reais do pipeline gráfico do Android foram descobertas pelos
+testes de CI e corrigidas:
+
+1. **Canvas não aceita bitmaps não-premultiplicados** — mensagem
+   `RuntimeException: Canvas: trying to use a non-premultiplied bitmap`. O Skia
+   recusa bitmaps unpremul como destino E como ORIGEM de qualquer operação de
+   Canvas. Consequência crítica: `Bitmap.createScaledBitmap` do bitmap original
+   (não-premul, construído com `setPremultiplied(false)`) lançaria
+   RuntimeException TAMBÉM EM DISPOSITIVO — os primeiros runs de CI
+   (39463695895, 39464838173) apanharam isto antes de chegar a produção.
+   **Correção:** quando há escala/fundo, a fonte de desenho é um bitmap
+   PREMULTIPLICADO construído com `setPixels` (que aceita sempre valores retos
+   e converte para a representação interna). O caminho 1x transparente mantém
+   o bitmap não-premul byte-exato, sem canvas.
+
+2. **Robolectric em modo LEGACY faz no-op das operações de Canvas** —
+   `drawColor`/`drawBitmap` eram silenciosamente ignorados nos testes
+   (bitmap ficava todo a 0), enquanto `createScaledBitmap` era simulado em
+   Java. Os testes passaram a usar `@GraphicsMode(GraphicsMode.Mode.NATIVE)`
+   — Skia real na JVM, mesmo comportamento do dispositivo — e foi assim que a
+   limitação 1 acima ficou provada com a mensagem exata.
+
+Correção final validada localmente: 141/141 testes unitários verdes
+(incluindo os 27 da classe `PngExportTest`) antes do push.
 
 ## Testes (`PngExportTest.kt`)
 
