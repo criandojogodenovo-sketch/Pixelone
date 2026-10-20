@@ -176,17 +176,16 @@ object PngExport {
     }
 
     /**
-     * Exportação com ESCALA e FUNDO escolhidos (novidade): constrói o
-     * bitmap ORIGINAL com as dimensões reais do canvas (via
-     * [buildBitmapFromDocument] — píxeis exatos do buffer partilhado
-     * Kotlin↔C++) e produz o bitmap FINAL escalado, sempre em
-     * nearest-neighbor:
+     * Exportação com ESCALA e FUNDO escolhidos (novidade): o bitmap ORIGINAL
+     * nasce com a largura e altura REAIS do canvas (píxeis exatos do buffer
+     * partilhado Kotlin↔C++, via [buildBitmapFromDocument]) e o bitmap FINAL
+     * é produzido sempre em nearest-neighbor:
      *
-     *  - [ScaleOption.X1] + [BackgroundOption.TRANSPARENT] devolve o
-     *    bitmap original SEM nenhum passo de desenho — caminho 1:1 com o
-     *    buffer (comportamento anterior, byte-exato, incl. alpha baixo).
+     *  - [ScaleOption.X1] + [BackgroundOption.TRANSPARENT] devolve o bitmap
+     *    original SEM nenhum passo de desenho — caminho 1:1 com o buffer
+     *    (comportamento anterior, byte-exato, incl. alpha baixo).
      *
-     *  - TRANSPARENT com escala > 1: `Bitmap.createScaledBitmap(original,
+     *  - TRANSPARENT com escala > 1: `Bitmap.createScaledBitmap(fonte,
      *    w*escala, h*escala, false)` — o `false` (filter) desliga a
      *    suavização e mantém os píxeis nítidos.
      *
@@ -197,90 +196,99 @@ object PngExport {
      *    — a alternativa prevista no pedido, necessária aqui porque o
      *    fundo tem de ser pintado antes da arte.
      *
-     * PRECISÃO: no caminho 1x transparente os bytes são EXATOS (setPixels
-     * direto, sem composição). Em escalas > 1 o desenho passa pelo espaço
-     * premultiplicado do Skia — píxeis opacos e totalmente transparentes
-     * permanecem exatos (o padrão da pixel art); alfas MUITO baixos
-     * (≤ ~7/255) podem sofrer arredondamento de 1 bit nos RGB, limitação
-     * conhecida do pipeline gráfico do Android.
+     * PREMULTIPLICAÇÃO (descoberta do CI, provada em modo NATIVE/Robolectric):
+     * o Skia REJEITA bitmaps não-premultiplicados em qualquer operação de
+     * Canvas — "Canvas: trying to use a non-premultiplied bitmap" — tanto
+     * como destino como como ORIGEM (em dispositivo seria igual: o
+     * `createScaledBitmap` do original não-premul lançaria RuntimeException).
+     * Por isso, quando há desenho, a fonte é um bitmap PREMULTIPLICADO
+     * construído com `setPixels` (que aceita sempre valores RETOS e converte
+     * para a representação interna). Consequências:
+     *  - o caminho 1x transparente continua byte-exato (sem canvas);
+     *  - em escalas, píxeis opacos e totalmente transparentes (o padrão da
+     *    pixel art) permanecem exatos; alfas MUITO baixos (≤ ~7/255) podem
+     *    sofrer arredondamento de 1 bit nos RGB — limitação conhecida do
+     *    pipeline gráfico do Android, registada no relatório docs/.
      *
      * @throws IllegalStateException se as dimensões escaladas excederem
      *         os limites ([validateScaledDimensions]) ou se algum bitmap
      *         nascer null/reciclado — nunca devolve um bitmap sem
-     *         condições para ser comprimido. O bitmap ORIGINAL usado como
-     *         origem é reciclado antes de devolver (só o final sobrevive).
+     *         condições para ser comprimido.
      */
     fun buildBitmapFromDocument(
         doc: PixelDocument,
         scale: ScaleOption,
         background: BackgroundOption
     ): Bitmap {
-        val original = buildBitmapFromDocument(doc)
         val s = scale.factor
         if (s == 1 && background == BackgroundOption.TRANSPARENT) {
-            return original // caminho exato: igual ao comportamento anterior
+            // Caminho exato: bitmap não-premultiplicado 1:1 com o buffer,
+            // igual ao comportamento anterior (setPixels direto, sem canvas)
+            return buildBitmapFromDocument(doc)
         }
-        try {
-            validateScaledDimensions(doc.width, doc.height, s)
-            val sw = doc.width * s
-            val sh = doc.height * s
+        validateScaledDimensions(doc.width, doc.height, s)
+        val sw = doc.width * s
+        val sh = doc.height * s
 
-            val final: Bitmap = if (background == BackgroundOption.SOLID_BLACK) {
-                // Fundo sólido: bitmap final novo → drawColor(preto) ANTES
-                // de desenhar → arte por cima com nearest-neighbor.
-                // NOTA: o destino de desenho mantém-se PREMULTIPLICADO
-                // (padrão) — é o único formato de destino de Canvas
-                // suportado pelo pipeline gráfico (dispositivo e Robolectric).
-                // Como o resultado final é 100% OPACO (preto + arte), premul
-                // e reto coincidem byte a byte e o PNG sai exato.
-                val out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
-                    ?: throw IllegalStateException(
-                        "Bitmap.createBitmap devolveu null (${sw}x${sh})"
-                    )
-                if (out.isRecycled) {
-                    throw IllegalStateException("Bitmap de fundo foi reciclado")
-                }
-                val canvas = Canvas(out)
-                // 1º PREENCHER o fundo (antes de desenhar a arte — receita)
-                canvas.drawColor(android.graphics.Color.BLACK)
-                // 2º desenhar a arte escalada, sem suavização nem anti-alias
-                val paint = nearestNeighborPaint()
-                val dst = RectF(0f, 0f, sw.toFloat(), sh.toFloat())
-                canvas.drawBitmap(original, null, dst, paint)
-                out
-            } else {
-                // Fundo transparente: createScaledBitmap com filter=false —
-                // nearest-neighbor puro, alfa da arte preservado.
-                val scaled = Bitmap.createScaledBitmap(original, sw, sh, false)
-                    ?: throw IllegalStateException(
-                        "createScaledBitmap devolveu null " +
-                            "(${doc.width}x${doc.height} → ${sw}x${sh})"
-                    )
-                if (scaled.isRecycled) {
-                    throw IllegalStateException("Bitmap escalado foi reciclado")
-                }
-                // Sanity: as dimensões finais têm de ser exatamente w*s × h*s
-                check(scaled.width == sw && scaled.height == sh) {
-                    "Bitmap escalado tem ${scaled.width}x${scaled.height}; " +
-                        "esperado ${sw}x${sh}"
-                }
-                scaled
-            }
+        // Fonte de desenho PREMULTIPLICADA com os mesmos píxeis retos do
+        // documento (setPixels/getPixels trabalham sempre em alfa reto; a
+        // conversão para a representação interna é feita pelo framework).
+        // É a única forma de a fonte entrar no Canvas sem RuntimeException.
+        val problem = doc.bufferValidationProblem()
+        if (problem != null) {
+            throw IllegalStateException("Buffer de píxeis inválido: $problem")
+        }
+        val src = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
+            ?: throw IllegalStateException(
+                "Bitmap.createBitmap devolveu null (${doc.width}x${doc.height})"
+            )
+        if (src.isRecycled) {
+            throw IllegalStateException("Bitmap fonte de desenho foi reciclado")
+        }
+        src.setPixels(doc.copyPixels(), 0, doc.width, 0, 0, doc.width, doc.height)
 
-            // Verificação final: nunca devolver um bitmap sem condições
-            if (final.isRecycled || final.width != sw || final.height != sh) {
-                throw IllegalStateException(
-                    "Bitmap final inválido: ${final.width}x${final.height}, " +
-                        "reciclado=${final.isRecycled} (esperado ${sw}x${sh})"
+        val final: Bitmap = if (background == BackgroundOption.SOLID_BLACK) {
+            // Fundo sólido: bitmap final novo → drawColor(preto) ANTES de
+            // desenhar → arte por cima com nearest-neighbor (fonte e destino
+            // premultiplicados: o único caminho aceito pelo Canvas/Skia).
+            val out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
+                ?: throw IllegalStateException(
+                    "Bitmap.createBitmap devolveu null (${sw}x${sh})"
                 )
+            if (out.isRecycled) {
+                throw IllegalStateException("Bitmap de fundo foi reciclado")
             }
-            return final
-        } finally {
-            // A origem já não é necessária — o chamador só recebe o final.
-            if (s != 1 || background != BackgroundOption.TRANSPARENT) {
-                original.recycle()
+            val canvas = Canvas(out)
+            // 1º PREENCHER o fundo (antes de desenhar a arte — receita)
+            canvas.drawColor(android.graphics.Color.BLACK)
+            // 2º desenhar a arte escalada, sem suavização nem anti-alias
+            val paint = nearestNeighborPaint()
+            val dst = RectF(0f, 0f, sw.toFloat(), sh.toFloat())
+            canvas.drawBitmap(src, null, dst, paint)
+            out
+        } else {
+            // Fundo transparente: createScaledBitmap com filter=false —
+            // nearest-neighbor puro, alfa da arte preservado.
+            val scaled = Bitmap.createScaledBitmap(src, sw, sh, false)
+                ?: throw IllegalStateException(
+                    "createScaledBitmap devolveu null " +
+                        "(${doc.width}x${doc.height} → ${sw}x${sh})"
+                )
+            if (scaled.isRecycled) {
+                throw IllegalStateException("Bitmap escalado foi reciclado")
             }
+            scaled
         }
+        src.recycle() // já foi desenhada — só o final sobrevive
+
+        // Verificação final: nunca devolver um bitmap sem condições
+        if (final.isRecycled || final.width != sw || final.height != sh) {
+            throw IllegalStateException(
+                "Bitmap final inválido: ${final.width}x${final.height}, " +
+                    "reciclado=${final.isRecycled} (esperado ${sw}x${sh})"
+            )
+        }
+        return final
     }
 
     // ------------------------------------------------------------------
