@@ -228,6 +228,11 @@ object PngExport {
             val final: Bitmap = if (background == BackgroundOption.SOLID_BLACK) {
                 // Fundo sólido: bitmap final novo → drawColor(preto) ANTES
                 // de desenhar → arte por cima com nearest-neighbor.
+                // NOTA: o destino de desenho mantém-se PREMULTIPLICADO
+                // (padrão) — é o único formato de destino de Canvas
+                // suportado pelo pipeline gráfico (dispositivo e Robolectric).
+                // Como o resultado final é 100% OPACO (preto + arte), premul
+                // e reto coincidem byte a byte e o PNG sai exato.
                 val out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
                     ?: throw IllegalStateException(
                         "Bitmap.createBitmap devolveu null (${sw}x${sh})"
@@ -235,9 +240,6 @@ object PngExport {
                 if (out.isRecycled) {
                     throw IllegalStateException("Bitmap de fundo foi reciclado")
                 }
-                // Destino totalmente opaco (preto + arte) — valores retos,
-                // sem premultiplicação, mantêm as cores byte-exatas.
-                out.setPremultiplied(false)
                 val canvas = Canvas(out)
                 // 1º PREENCHER o fundo (antes de desenhar a arte — receita)
                 canvas.drawColor(android.graphics.Color.BLACK)

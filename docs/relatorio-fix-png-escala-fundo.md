@@ -82,6 +82,16 @@ verificado: não nulo, não reciclado, dimensões exatamente `w*s × h*s`.
 - Fundo preto: alfa do resultado é sempre 255; semi-transparências são achatadas
   sobre o preto (canal × alfa), que é o resultado visual correto de "flatten".
 
+### Descoberta do CI (corrigida no mesmo branch)
+
+A primeira submissão desenhava o fundo preto num destino `setPremultiplied(false)`.
+O CI falhou com `RuntimeException` nos 2 testes de fundo preto — e o motivo é
+estrutural, não só do Robolectric: **o Skia não aceita superfícies de Canvas com
+alphaType `kUnpremul`** (`SkSurfaces::Raster` devolve null → exceção), também em
+dispositivo. Correção: o destino do desenho mantém-se PREMULTIPLICADO (padrão).
+Como o resultado do fundo preto é 100% opaco (preto + arte), premul e reto
+coincidem byte a byte e o PNG sai exato; os testes passaram a validar isso.
+
 ## Testes (`PngExportTest.kt`)
 
 Todos em JVM/Robolectric (sdk 34). Novos 12 testes, cobrindo:
