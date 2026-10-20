@@ -31,6 +31,10 @@ android {
         versionCode = 3
         versionName = "0.3.0-performance"
 
+        // Runner dos testes instrumentados (androidx) — sem esta linha o
+        // runner legado descobre 0 testes (comportamento verificado no CI).
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndk {
             // Preserva a cobertura de ABIs do projeto (sem nativo antes,
             // todas eram possíveis): arm64-v8a/armeabi-v7a para telemóveis,
