@@ -1,0 +1,192 @@
+# Pixel One — GitHub Actions
+#
+# Compila a variante release do Pixel One, assina o APK com o keystore de
+# release guardado nos secrets do repositório, valida a assinatura com o
+# apksigner do Android SDK e publica o APK como artefacto descarregável.
+#
+# Secrets necessários (Settings -> Secrets and variables -> Actions):
+#   ANDROID_KEYSTORE_BASE64    — keystore de release codificado em base64
+#   ANDROID_KEYSTORE_PASSWORD  — senha do keystore
+#   ANDROID_KEY_ALIAS          — alias da chave de release
+#   ANDROID_KEY_PASSWORD       — senha da chave de release
+#
+# Instruções completas de configuração e descarga no README.
+
+name: android-release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# Princípio do menor privilégio: ler o código e escrever caches de Actions.
+# Sem pull_request trigger, secrets nunca ficam acessíveis a builds de forks.
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Compilar, assinar e validar APK release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Validar Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Configurar Gradle com cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Verificar presenca dos secrets de assinatura
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          faltam=0
+          for var in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Secret de assinatura ausente: ${var}"
+              faltam=1
+            fi
+          done
+          if [ "${faltam}" -ne 0 ]; then
+            echo ""
+            echo "============================================================"
+            echo "BLOQUEIO: secrets de assinatura release nao configurados."
+            echo "O workflow falha DELIBERADAMENTE para nao publicar um APK"
+            echo "release nao assinado. Define os 4 secrets no repositorio"
+            echo "(Settings -> Secrets and variables -> Actions):"
+            echo "  ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,"
+            echo "  ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD"
+            echo "Instrucoes completas no README (secao 'APK Release assinado')."
+            echo "============================================================"
+            echo ""
+            exit 1
+          fi
+          echo "Secrets de assinatura presentes (os valores nunca sao impressos)."
+
+      - name: Decodificar keystore para ficheiro temporario protegido
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KS_PATH="${RUNNER_TEMP}/pixel-one-release.keystore"
+          printf '%s' "${KEYSTORE_B64}" | base64 --decode > "${KS_PATH}"
+          chmod 600 "${KS_PATH}"
+          echo "Keystore decodificado em ficheiro temporario protegido (conteudo nunca impresso)."
+          echo "PIXELONE_KEYSTORE_PATH=${KS_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Executar testes unitarios e compilar variante release
+        env:
+          PIXELONE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PIXELONE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PIXELONE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:testReleaseUnitTest :app:assembleRelease --stacktrace
+
+      - name: Validar APK e assinatura com apksigner
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          BUILD_TOOLS_DIR="$(ls -d "${SDK_ROOT}/build-tools/"*/ | sort -V | tail -n 1)"
+          APKSIGNER="${BUILD_TOOLS_DIR}apksigner"
+          AAPT2="${BUILD_TOOLS_DIR}aapt2"
+          APK_DIR="app/build/outputs/apk/release"
+
+          if [ ! -x "${APKSIGNER}" ]; then
+            echo "::error::apksigner nao encontrado em ${BUILD_TOOLS_DIR}"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          APKS=("${APK_DIR}"/*.apk)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::Nenhum APK encontrado em ${APK_DIR} — a compilacao nao produziu artefacto."
+            exit 1
+          fi
+
+          mkdir -p dist
+          : > SHA256SUMS.txt
+          : > apksigner-report.txt
+
+          {
+            echo "## Relatorio de validacao — APK Release do Pixel One"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "| --- | --- |"
+            echo "| Execucao | #${GITHUB_RUN_NUMBER} (commit ${GITHUB_SHA::7}) |"
+            echo "| Variante | release |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          for APK in "${APKS[@]}"; do
+            TAMANHO="$(stat -c%s "${APK}")"
+            if [ "${TAMANHO}" -le 100000 ]; then
+              echo "::error::APK vazio ou suspeito: ${APK} (${TAMANHO} bytes)"
+              exit 1
+            fi
+
+            echo "### $(basename "${APK}")" >> "${GITHUB_STEP_SUMMARY}"
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+            if ! "${APKSIGNER}" verify --verbose --print-certs "${APK}" | tee -a apksigner-report.txt; then
+              echo "::error::Validacao apksigner falhou para ${APK}"
+              exit 1
+            fi
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+            echo "" >> "${GITHUB_STEP_SUMMARY}"
+
+            VERSAO="$("${AAPT2}" dump badging "${APK}" | sed -nE "s/^package:.*versionName='([^']+)'.*/\1/p" | head -n 1)"
+            [ -n "${VERSAO}" ] || VERSAO="desconhecida"
+            SHA256="$(sha256sum "${APK}" | awk '{print $1}')"
+
+            {
+              echo "| Tamanho | ${TAMANHO} bytes |"
+              echo "| versionName | ${VERSAO} |"
+              echo "| SHA-256 | \`${SHA256}\` |"
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            NOME_DIST="PixelOne-${VERSAO}-release.apk"
+            cp "${APK}" "dist/${NOME_DIST}"
+            echo "${SHA256}  ${NOME_DIST}" >> SHA256SUMS.txt
+          done
+
+          cp SHA256SUMS.txt apksigner-report.txt dist/
+          echo "Validacao concluida: assinatura confirmada pelo apksigner (detalhes no resumo da execucao e no artefacto)."
+
+      - name: Remover keystore temporario
+        if: always()
+        run: |
+          if [ -n "${PIXELONE_KEYSTORE_PATH:-}" ]; then
+            rm -f "${PIXELONE_KEYSTORE_PATH}"
+            echo "Keystore temporario removido do runner."
+          fi
+
+      - name: Publicar APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel-One-Release-APK
+          path: dist/*
+          retention-days: 30
+          if-no-files-found: error
