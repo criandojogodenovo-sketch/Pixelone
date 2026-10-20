@@ -1,8 +1,15 @@
 package com.pixelone.studio.editor
 
 import android.app.Application
+import android.content.ContentValues
+import android.content.ContentResolver
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
+import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
+import android.widget.Toast
+import com.pixelone.studio.export.PngExport
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -476,29 +483,45 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
     }
 
     /**
-     * Exporta a imagem atual como PNG para o URI SAF escolhido.
+     * Exporta a imagem atual como PNG para o URI SAF escolhido (caminho
+     * LEGADO, usado apenas em Android < 10; em Android 10+ o ecrã usa
+     * [exportPngToDownloads], direto para Download/ via MediaStore).
+     *
      * Exporta APENAS os píxeis do documento (nunca grelha, quadriculado,
      * preview do traço ou UI) — o snapshot é tirado no executor de mutação.
+     *
+     * CORREÇÕES vs. versão anterior (bug do ficheiro 0 bytes):
+     * - SEM retorno silencioso: sem documento aberto avisa com Toast e
+     *   remove o ficheiro que o seletor SAF já criou vazio;
+     * - em qualquer falha remove o destino (nunca fica um ficheiro vazio
+     *   ou truncado em Download/) e mostra Toast com a mensagem real;
+     * - usa o mesmo núcleo testável [PngExport.buildBitmapFromDocument]
+     *   (bitmap verificado: não nulo, não reciclado, píxeis exatos).
      */
-    fun exportPng(uri: android.net.Uri, onDone: (Boolean) -> Unit) {
-        val doc = document ?: return
+    fun exportPng(uri: Uri, onDone: (Boolean) -> Unit) {
+        val doc = document
+        if (doc == null) {
+            // O seletor SAF criou o ficheiro vazio ao confirmar; removê-lo
+            // evita o órfão 0 bytes que motivou esta correção.
+            runCatching { getApplication<Application>().contentResolver.delete(uri, null, null) }
+            toast("Falha ao exportar PNG: não há projeto aberto (ok=false)")
+            onDone(false)
+            return
+        }
         isBusy.value = true
         viewModelScope.launch {
             try {
-                val snapshot = withContext(mutationDispatcher) { doc.copyPixels() }
-                withContext(Dispatchers.IO) {
-                    // Não premultiplicado: os valores RGBA são escritos no PNG
-                    // EXATAMENTE como estão no documento (pixel art exige bytes
-                    // exatos, inclusive com alpha muito baixo).
-                    val bmp = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
-                    bmp.setPremultiplied(false)
-                    bmp.copyPixelsFromBuffer(IntBuffer.wrap(snapshot))
-                    val resolver = getApplication<Application>().contentResolver
-                    resolver.openOutputStream(uri, "wt")?.use { out ->
-                        if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, out.buffered())) {
-                            throw java.io.IOException("Falha ao codificar PNG")
-                        }
-                    } ?: throw java.io.IOException("Não foi possível abrir o destino")
+                val bmp = withContext(mutationDispatcher) { PngExport.buildBitmapFromDocument(doc) }
+                try {
+                    withContext(Dispatchers.IO) {
+                        val resolver = getApplication<Application>().contentResolver
+                        resolver.openOutputStream(uri, "wt")?.use { out ->
+                            // compress → flush → close (use{}) — ordem exata,
+                            // bytes contados para o feedback.
+                            PngExport.writePngToStream(bmp, out)
+                        } ?: throw java.io.IOException("Não foi possível abrir o destino")
+                    }
+                } finally {
                     bmp.recycle()
                 }
                 withContext(Dispatchers.Main) {
@@ -506,8 +529,11 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
                     onDone(true)
                 }
             } catch (e: Exception) {
+                // Falha: remove o destino parcial/vazio — nunca fica um
+                // ficheiro quebrado em Download/.
+                runCatching { getApplication<Application>().contentResolver.delete(uri, null, null) }
                 withContext(Dispatchers.Main) {
-                    showMessage("Falha ao exportar PNG: ${e.message}")
+                    toast("Falha ao exportar PNG: ${e.message ?: e.javaClass.simpleName} (ok=false)")
                     onDone(false)
                 }
             } finally {
@@ -515,6 +541,158 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // Exportação PNG DIRETA para Download/ (MediaStore + IS_PENDING)
+    // ------------------------------------------------------------------
+
+    /**
+     * Exporta a imagem atual como PNG diretamente para Download/, SEM
+     * seletor de ficheiros, via MediaStore com ciclo IS_PENDING. Ordem
+     * exata dos passos (todos com feedback obrigatório num Toast):
+     *
+     *  1) Bitmap ARGB_8888 com a largura/altura REAIS da tela de pixel
+     *     art, píxeis copiados do buffer C++ (buffer direto partilhado
+     *     Kotlin↔C++); bitmap verificado: não nulo, não reciclado.
+     *  2) ContentValues: DISPLAY_NAME (único), MIME_TYPE=image/png,
+     *     RELATIVE_PATH=Download/, IS_PENDING=1.
+     *  3) contentResolver.openOutputStream(uri) → `val ok =
+     *     bitmap.compress(PNG, 100, out)` → out.flush() → close (use{}).
+     *  4) IS_PENDING=0 — o ficheiro só se torna visível com conteúdo.
+     *  5) Toast de sucesso com ok=true e o tamanho real em bytes.
+     *  6) Qualquer exceção: Toast com e.message (ok=false) e REMOÇÃO da
+     *     entrada pendente — nunca fica um ficheiro 0 bytes em Download/.
+     */
+    fun exportPngToDownloads() {
+        val doc = document
+        if (doc == null) {
+            toast("Falha ao exportar PNG: não há projeto aberto (ok=false)")
+            return
+        }
+        if (isBusy.value) return // evita inserções duplicadas por duplo toque
+        isBusy.value = true
+        viewModelScope.launch {
+            var pendingUri: Uri? = null
+            try {
+                // 1) Bitmap verificado a partir do buffer partilhado C++/Kotlin
+                val bmp = withContext(mutationDispatcher) {
+                    PngExport.buildBitmapFromDocument(doc)
+                }
+                try {
+                    withContext(Dispatchers.IO) {
+                        val resolver = getApplication<Application>().contentResolver
+                        val name = PngExport.displayNameFor(
+                            projectName,
+                            existingDownloadNames(resolver),
+                            System.currentTimeMillis()
+                        )
+                        // 2) Entrada pendente no MediaStore (Download/)
+                        val collection =
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                            } else {
+                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                            }
+                        val uri = resolver.insert(
+                            collection,
+                            PngExport.mediaValues(name, Build.VERSION.SDK_INT)
+                        ) ?: throw java.io.IOException("MediaStore não criou a entrada para \"$name\"")
+                        pendingUri = uri
+
+                        val startNanos = System.nanoTime()
+                        // 3) compress → flush → close dentro de use{}
+                        val result = resolver.openOutputStream(uri)?.use { out ->
+                            PngExport.writePngToStream(bmp, out)
+                        } ?: throw java.io.IOException("openOutputStream devolveu null para \"$name\"")
+
+                        // 4) Publica: IS_PENDING=0 só DEPOIS do conteúdo escrito
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            resolver.update(
+                                uri,
+                                ContentValues().apply {
+                                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                                },
+                                null,
+                                null
+                            )
+                        }
+                        pendingUri = null // sucesso — nada a limpar
+
+                        val ms = (System.nanoTime() - startNanos) / 1_000_000.0
+                        val finalName = queryDisplayName(resolver, uri) ?: name
+                        PerfLog.i(
+                            TAG_EXPORT,
+                            "PNG Download/ docs=${doc.width}x${doc.height} " +
+                                "bytes=${result.bytes} codificar=$ms ms"
+                        )
+                        // 5) Toast obrigatório: ok + tamanho real em bytes
+                        withContext(Dispatchers.Main.immediate) {
+                            toast(
+                                "PNG exportado: Download/$finalName — " +
+                                    "ok=${result.ok}, ${result.bytes} bytes"
+                            )
+                        }
+                    }
+                } finally {
+                    bmp.recycle()
+                }
+            } catch (e: Exception) {
+                // 6) Falha: remove a entrada PENDENTE (nunca fica um 0 bytes
+                //     órfão em Download/) e mostra o erro SEM engolir.
+                pendingUri?.let { uri ->
+                    runCatching {
+                        getApplication<Application>().contentResolver.delete(uri, null, null)
+                    }
+                }
+                PerfLog.e(TAG_EXPORT, "falha: ${e.message ?: e.javaClass.simpleName}")
+                withContext(Dispatchers.Main.immediate) {
+                    toast("Falha ao exportar PNG: ${e.message ?: e.javaClass.simpleName} (ok=false)")
+                }
+            } finally {
+                withContext(Dispatchers.Main.immediate) { isBusy.value = false }
+            }
+        }
+    }
+
+    /** Toast na main thread — todo o desfecho da exportação é visível. */
+    private fun toast(message: String) {
+        try {
+            Toast.makeText(getApplication(), message, Toast.LENGTH_LONG).show()
+        } catch (_: Throwable) {
+            // JVM de testes / contexto sem Looper: sem crash, o estado
+            // continua a ser reportado por [statusMessage].
+            showMessage(message)
+        }
+    }
+
+    /** Nomes de ficheiros já presentes na coleção de downloads do MediaStore. */
+    private fun existingDownloadNames(resolver: ContentResolver): Set<String> = runCatching {
+        val collection =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            } else {
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            }
+        val names = mutableSetOf<String>()
+        resolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+            null,
+            null,
+            null
+        )?.use { c ->
+            val idx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+            while (c.moveToNext()) names.add(c.getString(idx) ?: "")
+        }
+        names
+    }.getOrDefault(emptySet())
+
+    /** Nome real atribuído pelo provider (pode ter ajustado colisões). */
+    private fun queryDisplayName(resolver: ContentResolver, uri: Uri): String? = runCatching {
+        resolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+    }.getOrNull()
 
     // ------------------------------------------------------------------
     // Traço: preview ao vivo + lote único no fim do gesto
@@ -873,5 +1051,6 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
 
         private const val TAG_TOUCH = "PixelOnePerf/Touch"
         private const val TAG_RENDER = "PixelOnePerf/Render"
+        private const val TAG_EXPORT = "PixelOnePerf/Export"
     }
 }

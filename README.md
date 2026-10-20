@@ -86,8 +86,13 @@ Implementado nesta fase (sobre a fundação da Fase 0):
   perda de dados, transparência preservada, gravação atómica (falha de
   escrita nunca destrói o ficheiro anterior), validação de versões
   desconhecidas e rejeição controlada de ficheiros inválidos.
-- **Exportação PNG** via SAF: valores RGBA exatos (bitmap não premultiplicado),
-  transparência preservada; grelha e UI nunca entram no ficheiro.
+- **Exportação PNG** direta para `Download/` (Android 10+) via MediaStore com
+  ciclo `IS_PENDING` — o ficheiro só se torna visível com o conteúdo escrito
+  (nunca mais um PNG 0 bytes), Toast final com `ok` e o tamanho real em bytes,
+  e remoção automática da entrada pendente em caso de falha; valores RGBA
+  exatos (bitmap não premultiplicado), transparência preservada; grelha e UI
+  nunca entram no ficheiro. Em Android < 10 mantém-se o seletor SAF com o
+  mesmo núcleo testável e feedback obrigatório.
 - **Spritesheets** (quadros regulares + JSON por quadro) e **Atlas de
   texturas** (regiões de tamanhos diferentes + JSON por região), ambos com
   posicionamento determinístico, pré-visualização real e limites de memória.

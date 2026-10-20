@@ -1,5 +1,6 @@
 package com.pixelone.studio.ui.texture
 
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -97,6 +98,9 @@ fun TextureStudioScreen(onBack: () -> Unit) {
     val snackbarHostState = remember { SnackbarHostState() }
 
     // --------------------------- SAF launchers ------------------------------
+    // Exportação PNG: em Android 10+ (Q) é DIRETA para Download/ via
+    // MediaStore com IS_PENDING (sem seletor; ver exportPngToDownloads).
+    // Este launcher SAF fica apenas como caminho legado de Android < 10.
     val exportPngLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("image/png")
     ) { uri -> if (uri != null) viewModel.exportPng(uri) {} }
@@ -203,7 +207,16 @@ fun TextureStudioScreen(onBack: () -> Unit) {
                         }
                         IconButton(
                             enabled = doc != null,
-                            onClick = { exportPngLauncher.launch("${viewModel.projectName}.png") }
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    // Direto para Download/ (MediaStore, IS_PENDING):
+                                    // cria o ficheiro só quando o conteúdo está
+                                    // escrito — nunca mais um PNG 0 bytes.
+                                    viewModel.exportPngToDownloads()
+                                } else {
+                                    exportPngLauncher.launch("${viewModel.projectName}.png")
+                                }
+                            }
                         ) {
                             Icon(PixelIcons.export(), contentDescription = "Exportar PNG", tint = MaterialTheme.colorScheme.onSurface)
                         }
