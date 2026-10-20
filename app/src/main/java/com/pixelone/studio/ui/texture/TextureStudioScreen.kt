@@ -6,6 +6,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -51,6 +53,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -189,6 +192,17 @@ fun TextureStudioScreen(onBack: () -> Unit) {
                         }
                         IconButton(
                             enabled = doc != null,
+                            onClick = { viewModel.saveProject {} }
+                        ) {
+                            Icon(
+                                PixelIcons.save(),
+                                contentDescription = "Guardar",
+                                tint = if (doc != null) MaterialTheme.colorScheme.onSurface
+                                else MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        IconButton(
+                            enabled = doc != null,
                             onClick = { exportPngLauncher.launch("${viewModel.projectName}.png") }
                         ) {
                             Icon(PixelIcons.export(), contentDescription = "Exportar PNG", tint = MaterialTheme.colorScheme.onSurface)
@@ -251,6 +265,7 @@ fun TextureStudioScreen(onBack: () -> Unit) {
                         EmptyEditorHint(
                             onNew = { showNewDialog = true },
                             onOpen = { showOpenSheet = true },
+                            onNewSpritesheet = { overlay = Overlay.Spritesheet },
                             onRestore = if (viewModel.pendingAutosave.value != null) {
                                 { viewModel.restoreAutosave {} }
                             } else null
@@ -377,6 +392,7 @@ private fun EditorDropdownMenu(
 // Barra inferior de ferramentas
 // ---------------------------------------------------------------------------
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun EditorBottomToolbar(
     viewModel: EditorViewModel,
@@ -384,6 +400,7 @@ fun EditorBottomToolbar(
 ) {
     val tool by viewModel.tool
     val activeColor by viewModel.activeColor
+    val secondaryColor by viewModel.secondaryColor
     val history = viewModel.history
     val doc = viewModel.document
     // Leitura do contador de frames garante recomposição em cada edição
@@ -398,12 +415,13 @@ fun EditorBottomToolbar(
     ) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-        // Linha 1: ferramentas + undo/redo + zoom + grelha
+        // Linha 1: ferramentas + undo/redo — scroll horizontal em ecrãs estreitos
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier
                 .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
                 .padding(horizontal = 4.dp, vertical = 2.dp)
         ) {
             ToolButton(PixelIcons.pencil(), "Lápis", tool == PixelEngine.Tool.PENCIL) {
@@ -419,17 +437,15 @@ fun EditorBottomToolbar(
                 viewModel.tool.value = PixelEngine.Tool.EYEDROPPER
             }
 
-            Spacer(Modifier.weight(1f))
-
             // Undo / redo
-            IconButton(onClick = { viewModel.undo() }, enabled = history.canUndo()) {
+            IconButton(onClick = { viewModel.undo() }, enabled = history.canUndo() || viewModel.frameVersion.intValue >= 0) {
                 Icon(
                     PixelIcons.undo(), contentDescription = "Desfazer",
                     tint = if (history.canUndo()) MaterialTheme.colorScheme.onSurface
                     else MaterialTheme.colorScheme.outline
                 )
             }
-            IconButton(onClick = { viewModel.redo() }, enabled = history.canRedo()) {
+            IconButton(onClick = { viewModel.redo() }, enabled = history.canRedo() || viewModel.frameVersion.intValue >= 0) {
                 Icon(
                     PixelIcons.redo(), contentDescription = "Refazer",
                     tint = if (history.canRedo()) MaterialTheme.colorScheme.onSurface
@@ -438,7 +454,7 @@ fun EditorBottomToolbar(
             }
         }
 
-        // Linha 2: cor ativa + paleta + pincel + zoom + grelha
+        // Linha 2: cores primária/secundária + paleta + pincel + zoom + grelha
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
@@ -446,18 +462,45 @@ fun EditorBottomToolbar(
                 .horizontalScroll(rememberScrollState())
                 .padding(horizontal = 8.dp, vertical = 4.dp)
         ) {
-            // Cor ativa → abre o seletor
-            Box(
-                Modifier
-                    .size(36.dp)
-                    .background(checkerPattern())
-                    .border(2.dp, MaterialTheme.colorScheme.primary)
-                    .clickable { onOpenColorPicker() }
-            ) {
+            // Cor secundária (atrás) + primária (à frente) — estilo Aseprite.
+            Box(Modifier.size(40.dp)) {
+                // Secundária (canto superior direito, atrás)
                 Box(
                     Modifier
-                        .fillMaxSize()
-                        .background(androidx.compose.ui.graphics.Color(activeColor))
+                        .align(Alignment.TopEnd)
+                        .size(24.dp)
+                        .background(checkerPattern())
+                        .border(1.dp, MaterialTheme.colorScheme.outline)
+                        .clickable { viewModel.swapColors() }
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .background(androidx.compose.ui.graphics.Color(secondaryColor))
+                    )
+                }
+                // Primária (canto inferior esquerdo, à frente)
+                Box(
+                    Modifier
+                        .align(Alignment.BottomStart)
+                        .size(28.dp)
+                        .background(checkerPattern())
+                        .border(2.dp, MaterialTheme.colorScheme.primary)
+                        .clickable { onOpenColorPicker() }
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .background(androidx.compose.ui.graphics.Color(activeColor))
+                    )
+                }
+            }
+            // Trocar primária ↔ secundária
+            IconButton(onClick = { viewModel.swapColors() }) {
+                Icon(
+                    PixelIcons.swapColors(),
+                    contentDescription = "Trocar cor primária e secundária",
+                    tint = MaterialTheme.colorScheme.onSurface
                 )
             }
             IconButton(onClick = onOpenColorPicker) {
@@ -465,8 +508,8 @@ fun EditorBottomToolbar(
             }
             Spacer(Modifier.width(4.dp))
 
-            // Cores da paleta do projeto (toque escolhe; seletor completo abre
-            // a partir da cor ativa ou do ícone da paleta)
+            // Cores da paleta do projeto: toque escolhe a PRIMÁRIA; toque longo
+            // define a SECUNDÁRIA. Sem interromper a edição.
             viewModel.palette.value.forEach { color ->
                 Box(
                     Modifier
@@ -478,7 +521,10 @@ fun EditorBottomToolbar(
                             color = if (color == activeColor) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.outline
                         )
-                        .clickable { viewModel.activeColor.value = color }
+                        .combinedClickable(
+                            onClick = { viewModel.activeColor.intValue = color },
+                            onLongClick = { viewModel.setSecondaryColor(color) }
+                        )
                 ) {
                     Box(
                         Modifier
@@ -553,7 +599,7 @@ private fun ToolButton(
 ) {
     Box(
         Modifier
-            .size(width = 52.dp, height = 44.dp),
+            .size(width = 58.dp, height = 48.dp),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -566,9 +612,17 @@ private fun ToolButton(
                 tint = if (selected) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.onSurfaceVariant
             )
+            // Rótulo visível (o ícone sozinho não identifica a ferramenta).
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (selected) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
             Box(
                 Modifier
-                    .padding(top = 2.dp)
+                    .padding(top = 1.dp)
                     .size(width = 28.dp, height = 2.dp)
                     .background(
                         if (selected) MaterialTheme.colorScheme.primary
@@ -583,15 +637,21 @@ private fun ToolButton(
 // Ecrã vazio (sem documento)
 // ---------------------------------------------------------------------------
 
+/**
+ * Ecrã vazio (sem documento): as TRÊS ações principais são botões grandes e
+ * sempre visíveis — nunca escondidas apenas num menu de ícones.
+ */
 @Composable
 private fun EmptyEditorHint(
     onNew: () -> Unit,
     onOpen: () -> Unit,
+    onNewSpritesheet: () -> Unit,
     onRestore: (() -> Unit)?
 ) {
     Box(
         Modifier
             .fillMaxSize()
+            .testTag("empty_editor_hint")
             .background(MaterialTheme.colorScheme.background.copy(alpha = 0.85f)),
         contentAlignment = Alignment.Center
     ) {
@@ -602,7 +662,7 @@ private fun EmptyEditorHint(
                 color = MaterialTheme.colorScheme.onBackground
             )
             Text(
-                "Cria um projeto novo ou abre um existente para começar.\n" +
+                "Escolhe uma ação para começar.\n" +
                     "1 dedo desenha · 2 dedos movem e fazem zoom.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -612,9 +672,14 @@ private fun EmptyEditorHint(
                     Text("Restaurar trabalho não guardado")
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onOpen) { Text("Abrir projeto") }
-                androidx.compose.material3.Button(onClick = onNew) { Text("Novo projeto") }
+            androidx.compose.material3.Button(onClick = onNew, modifier = Modifier.testTag("action_new_project")) {
+                Text("Novo projeto")
+            }
+            androidx.compose.material3.Button(onClick = onOpen, modifier = Modifier.testTag("action_open_recent")) {
+                Text("Abrir recente")
+            }
+            androidx.compose.material3.Button(onClick = onNewSpritesheet, modifier = Modifier.testTag("action_new_spritesheet")) {
+                Text("Novo spritesheet")
             }
         }
     }

@@ -47,7 +47,8 @@ import kotlin.math.roundToInt
 // Novo projeto
 // ---------------------------------------------------------------------------
 
-private val PRESETS = listOf(8, 16, 32, 64, 128, 256)
+/** Presets pedidos: 16, 32, 64 e 128 (tamanho personalizado nos campos). */
+private val PRESETS = listOf(16, 32, 64, 128)
 
 @Composable
 fun NewProjectDialog(
