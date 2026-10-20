@@ -9,7 +9,64 @@ de texturas a modelos 3D, com construção geométrica assistida 2D-para-3D.
 - **Modelo:** mobile-first, offline nas funções centrais, sem backend, contas, anúncios ou pagamentos
 - **Nota de rebranding:** todas as referências anteriores a "One Sprite Studio" passam a designar-se **Pixel One**
 
-## Estado do projeto — Fases 1+2 (editor de pixel art, persistência e exportação)
+## Estado do projeto — Correções de performance, canvas e UX (0.3.0)
+
+Correções implementadas nesta fase (sobre as Fases 1+2), em
+`fix/texture-studio-performance`:
+
+- **Motor C++17/JNI (`libpixelone_engine`)**: um traço completo (lote de
+  pontos do gesto) é processado em UMA chamada JNI com Bresenham, brocha,
+  borracha e balde; devolve deltas esparsos (índice, cor antiga, cor nova),
+  o dirty rect e a duração interna (`std::chrono::steady_clock`). Fallback
+  Kotlin idêntico (usado em JVM/testes e se a lib não carregar).
+- **Buffer direto partilhado**: os píxeis vivem num único
+  `ByteBuffer.allocateDirect` (`PixelDocument.sharedBuffer`) — fonte de
+  verdade única, vista `IntBuffer` persistente com acessos absolutos, lido
+  pelo C++ via `GetDirectBufferAddress` por chamada (sem ponteiros
+  retidos). Formato documentado em `docs/buffer-formato.md`.
+- **Sem trabalho proporcional ao documento por toque**: durante o gesto o
+  traço é um PREVIEW no canvas (não modifica píxeis); no fim, o lote vai ao
+  motor e o bitmap de apresentação é atualizado APENAS na região suja com
+  `Bitmap.setPixels` — nunca `setPixel` por píxel, nunca cópia integral por
+  evento, nunca recriação do bitmap.
+- **Histórico por deltas esparsos** com orçamento de memória (32 MB);
+  um traço/fill = UMA entrada; undo/redo aplicam deltas no executor serial
+  e atualizam o bitmap regionalmente.
+- **Threading**: executor serial `pixelone-doc-mutation` para TODAS as
+  mutações do documento (traço/fill/undo/redo/snapshots); gravação,
+  exportação e autosave operam sobre snapshots (sem leituras rasgadas);
+  atualizações visuais na main thread.
+- **Canvas aparece imediatamente** ao criar/abrir/importar/restaurar:
+  `document`/`imageBitmap` são estado Compose observável; viewport chega via
+  `onSizeChanged` (sem escrita de estado durante o draw); fit-to-screen
+  centrado quando o viewport tem dimensões válidas (pendingFit).
+- **Entrada do Texture Studio clara**: ecrã vazio com 3 ações principais
+  (Novo projeto, Abrir recente, Novo spritesheet), presets 16/32/64/128 +
+  personalizado, ação Guardar na barra superior, rótulos nas ferramentas,
+  barra inferior com scroll horizontal nas duas linhas, paleta com cor
+  primária/secundária (toque longo define a secundária; botão de troca) e
+  grelha com Path em cache.
+- **Instrumentação**: `PixelOnePerf/Touch`, `/JNI`, `/Render` — uma linha
+  por operação (dimensões, pontos, píxeis alterados, dirty rect, durações,
+  caminho nativo/fallback).
+- 114 testes unitários JVM (inclui buffer direto, traço em lote, deltas,
+  estado do ViewModel com Robolectric e benchmark de código) + testes
+  instrumentados (androidTest) que provam o buffer partilhado Kotlin↔C++ e
+  a visibilidade do canvas em emulador/dispositivo.
+
+Ainda **não** implementado (planeado): renderer 3D/OpenGL ES, mapeamento UV,
+construção 2D-para-3D, camadas, seleção/recorte.
+
+### Documentação técnica adicional
+
+- `docs/buffer-formato.md` — formato binário do buffer partilhado
+  (endianness, canais, stride, regras de vida útil e validação).
+- `docs/formato-osp.md` — especificação completa do formato nativo `.osp`.
+- `docs/spritesheet-atlas-json.md` — esquemas JSON dos metadados de exportação.
+- `docs/relatorio-fase-1-2.md` — relatório A–K das Fases 1+2.
+- `docs/relatorio-correcoes-performance.md` — relatório A–J desta correção.
+
+## Estado anterior — Fases 1+2 (editor de pixel art, persistência e exportação)
 
 Implementado nesta fase (sobre a fundação da Fase 0):
 
