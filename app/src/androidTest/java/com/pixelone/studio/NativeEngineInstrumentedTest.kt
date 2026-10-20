@@ -55,16 +55,18 @@ class NativeEngineInstrumentedTest {
     @Test
     fun kotlinECppLeemAMesmaMemoria() {
         val doc = PixelDocument(32, 32)
-        // Escreve um padrão pela vista Kotlin
+        // Escreve um padrão pela vista Kotlin (com alpha alto — prova de que
+        // a comparação é sobre os MESMOS bytes, não sobre sinais iguais)
         for (i in 0 until doc.pixelCount) {
             doc.setAt(i, 0xFF000000.toInt() or (i % 251))
         }
         // O C++ soma os MESMOS dados pelo endereço direto:
         val somaNativa = NativeEngine.probeBufferSum(doc, doc.pixelCount)
         assertNotNull("probe nativo deve funcionar (lib carregada)", somaNativa)
-        // A soma calculada pelo Kotlin coincide ⇔ mesma memória:
+        // A soma calculada pelo Kotlin coincide ⇔ mesma memória.
+        // (unsigned em ambos os lados: o C++ lê uint32_t)
         var somaKotlin = 0L
-        for (i in 0 until doc.pixelCount) somaKotlin += doc.getAt(i)
+        for (i in 0 until doc.pixelCount) somaKotlin += doc.getAt(i).toLong() and 0xFFFFFFFFL
         assertEquals("C++ e Kotlin devem ler o MESMO buffer", somaKotlin, somaNativa!!.toLong())
     }
 
@@ -119,8 +121,9 @@ class NativeEngineInstrumentedTest {
         val doc = PixelDocument(32, 32)
         doc.setAt(2 * 32 + 2, 0xFF111111.toInt())
         val scratch = NativeEngine.Scratch(doc.pixelCount)
+        // Lote de 3 pontos: (2,2) → (3,2) → (4,2)
         val result = NativeEngine.strokeBatch(
-            doc, intArrayOf(2, 2, 4, 2), 3, 0xFF222222.toInt(), 1, scratch
+            doc, intArrayOf(2, 2, 3, 2, 4, 2), 3, 0xFF222222.toInt(), 1, scratch
         )
         assertEquals(3, result!!.deltaCount)
         val byIndex = mutableMapOf<Int, Pair<Int, Int>>()

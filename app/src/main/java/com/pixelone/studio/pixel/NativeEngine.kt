@@ -206,9 +206,10 @@ object NativeEngine {
 
     /**
      * PROVA DE BUFFER PARTILHADO (teste instrumentado): o C++ lê diretamente
-     * os primeiros [count] inteiros do buffer e soma-os; o Kotlin compara com
-     * a soma calculada pela sua própria vista. Valores iguais ⇒ ambos os
-     * lados operam sobre a MESMA memória.
+     * os primeiros [count] inteiros do buffer (como uint32 SEM sinal) e
+     * soma-os; o Kotlin compara com a soma calculada pela sua própria vista
+     * com a MESMA semântica sem sinal. Valores iguais ⇒ ambos os lados
+     * operam sobre a MESMA memória.
      */
     fun probeBufferSum(document: PixelDocument, count: Int): Long? {
         if (!nativeAvailable) return null
@@ -218,8 +219,10 @@ object NativeEngine {
             PerfLog.w(TAG, "Probe nativo falhou: ${t.message}")
             return null
         }
+        // Sem sinal em ambos os lados: o C++ lê uint32_t; o Kotlin Int é
+        // com sinal, pelo que se mascara para 0..2^32-1 antes de somar.
         var kotlinSum = 0L
-        for (i in 0 until count) kotlinSum += document.getAt(i)
+        for (i in 0 until count) kotlinSum += document.getAt(i).toLong() and 0xFFFFFFFFL
         return if (nativeSum == kotlinSum) nativeSum else {
             PerfLog.e(TAG, "Buffer partilhado DIVERGENTE: nativo=$nativeSum kotlin=$kotlinSum")
             null
