@@ -9,7 +9,45 @@ de texturas a modelos 3D, com construção geométrica assistida 2D-para-3D.
 - **Modelo:** mobile-first, offline nas funções centrais, sem backend, contas, anúncios ou pagamentos
 - **Nota de rebranding:** todas as referências anteriores a "One Sprite Studio" passam a designar-se **Pixel One**
 
-## Estado do projeto — Fase 0 (fundação)
+## Estado do projeto — Fases 1+2 (editor de pixel art, persistência e exportação)
+
+Implementado nesta fase (sobre a fundação da Fase 0):
+
+- **Editor de pixel art real** no Texture Studio: canvas com zoom por pinça
+  (0,05×–64×) e pan, fundo quadriculado de transparência (nunca exportado),
+  grelha de píxeis opcional em zoom alto, renderização nítida sem interpolação.
+- **Ferramentas**: lápis (linhas contínuas Bresenham), borracha (transparência
+  real), balde de preenchimento com tolerância por canal, conta-gotas,
+  pincel 1–8 px, paleta de cores do projeto e seletor RGBA (sliders + hex).
+- **Estratégia de gestos documentada**: 1 dedo desenha; 2 dedos movem e fazem
+  zoom; um segundo dedo durante um traço CANCELA o traço (sem marcas
+  acidentais); botões dedicados de zoom/ajustar/grelha.
+- **Desfazer/refazer** com diferenças regionais: um traço contínuo inteiro é
+  UMA entrada do histórico; orçamento de memória de 32 MB com libertação
+  automática das entradas mais antigas; nova edição limpa o redo.
+- **Persistência `.osp`** (ZIP versionado, v1): guardar/abir/continuar sem
+  perda de dados, transparência preservada, gravação atómica (falha de
+  escrita nunca destrói o ficheiro anterior), validação de versões
+  desconhecidas e rejeição controlada de ficheiros inválidos.
+- **Exportação PNG** via SAF: valores RGBA exatos (bitmap não premultiplicado),
+  transparência preservada; grelha e UI nunca entram no ficheiro.
+- **Spritesheets** (quadros regulares + JSON por quadro) e **Atlas de
+  texturas** (regiões de tamanhos diferentes + JSON por região), ambos com
+  posicionamento determinístico, pré-visualização real e limites de memória.
+- **Autosave** no fundo da app (ON_STOP) com proposta de restauro.
+- 78 testes unitários JVM (motor 2D, histórico, .osp, repositório,
+  spritesheet, atlas, roundtrip PNG real via Robolectric).
+
+Ainda **não** implementado (planeado): renderer 3D/OpenGL ES, mapeamento UV,
+construção 2D-para-3D, camadas, seleção/recorte, testes em dispositivo físico.
+
+### Documentação técnica adicional
+
+- `docs/formato-osp.md` — especificação completa do formato nativo `.osp`.
+- `docs/spritesheet-atlas-json.md` — esquemas JSON dos metadados de exportação.
+- `docs/relatorio-fase-1-2.md` — relatório A–K das Fases 1+2.
+
+## Estado anterior — Fase 0 (fundação)
 
 Implementado nesta fase:
 
@@ -25,9 +63,12 @@ Ainda **não** implementado (planeado): editor de pixel art, renderer 3D/OpenGL 
 
 ## Espaços de trabalho
 
-1. **Texture Studio** — desenho de pixel art e criação de texturas 2D.
-2. **3D Texture Studio** — aplicação de texturas a modelos 3D através de UVs.
-3. **2D-to-3D Studio** — construção geométrica assistida por desenhos e referências ortográficas.
+1. **Texture Studio** — **editor de pixel art funcional** (Fases 1+2): desenho,
+   histórico, projetos `.osp`, exportação PNG, spritesheets e atlas.
+2. **3D Texture Studio** — aplicação de texturas a modelos 3D através de UVs
+   (planeado; o ecrã indica-o explicitamente).
+3. **2D-to-3D Studio** — construção geométrica assistida por desenhos e
+   referências ortográficas (planeado; o ecrã indica-o explicitamente).
 
 ## Decisões técnicas
 
@@ -36,9 +77,12 @@ Ainda **não** implementado (planeado): editor de pixel art, renderer 3D/OpenGL 
 | UI | Jetpack Compose | Projeto novo, UI declarativa oficial do Google, adaptação natural a mobile-first. Não se mistura com Android Views. |
 | minSdk / targetSdk | 26 / 35 | minSdk 26 cobre a grande maioria dos telemóveis ativos, permite ícones adaptativos sem PNGs legados e prepara OpenGL ES 3.0. |
 | OpenGL ES | Fase futura | Reservado para a visualização 3D; nada de OpenGL nesta fase. |
-| C++ / JNI | Só com vantagem demonstrável | Nenhum JNI na Fase 0. |
+| C++ / JNI | Só com vantagem demonstrável | Nenhum JNI nas Fases 0–2. |
+| Motor 2D | Kotlin puro (IntArray ARGB) | Testável em JVM sem dispositivo; separado do Bitmap/renderização. |
+| Mistura de cor | Substituição direta do píxel (sem blending alfa) | Padrão de editores de pixel art; cores exatas e previsíveis. |
+| Ícones | Vetoriais próprios (`PixelIcons`) | Evita material-icons-extended (~30 MB) com a minificação desligada. |
 | Armazenamento | Privado da app (`filesDir`) | Sem permissões abrangentes. O Storage Access Framework fica para exportar/importar ficheiros escolhidos pelo utilizador. |
-| Formato `.osp` | Fase posterior | Nada de serialização prematura; `formatVersion` já acompanha o modelo para migrações futuras. |
+| Formato `.osp` | ZIP v1 (manifest.json + pixels.rgba) | Versionado, sem perdas, seguro (lista branca de entradas, anti zip-bomb); ver `docs/formato-osp.md`. |
 | Tema | Escuro fixo | Identidade do produto e precisão de cor num editor de pixel art. |
 | Minificação R8 | Desativada na Fase 0 | Base pequena; reavaliar quando o código crescer. |
 
@@ -62,7 +106,7 @@ Pré-requisitos: JDK 17 e Android SDK (API 35 + build-tools) — ou simplesmente
 # Build de debug
 ./gradlew :app:assembleDebug
 
-# Testes unitários
+# Testes unitários (78 testes: motor, histórico, .osp, exportação, PNG)
 ./gradlew :app:testDebugUnitTest
 
 # Instalar num dispositivo/emulador ligado (opcional)
@@ -132,26 +176,38 @@ exigem a mesma chave.
 
 ```
 app/src/main/java/com/pixelone/studio/
-  MainActivity.kt          # ponto de entrada Compose
-  navigation/PixelOneApp.kt# grafo de navegação (4 rotas)
-  ui/theme/                # paleta, tipografia e tema escuro
-  ui/components/           # cartões, etiquetas de estado, scaffold, áreas reservadas
-  ui/home|texture|texture3d|studio2dto3d/  # ecrãs
-  project/                 # PixelProject + ProjectRepository (contrato e memória)
-app/src/test/              # testes unitários do modelo/repositório
-.github/workflows/android-release.yml     # CI de release assinado
-docs/relatorio-fase-0.md                  # relatório da Fase 0
+  MainActivity.kt            # ponto de entrada Compose
+  navigation/PixelOneApp.kt  # grafo de navegação (4 rotas)
+  pixel/                     # MOTOR 2D (Kotlin puro): PixelDocument, PixelEngine,
+                             # HistoryManager — testável em JVM
+  osp/                       # formato .osp: OspCodec, MiniJson, FileSystemProjectRepository
+  export/                    # SpriteSheetPlanner, AtlasPacker (determinísticos)
+  editor/                    # EditorViewModel (estado do editor), PixelIcons
+  ui/editor/                 # PixelCanvas (gestos/render), diálogos, spritesheet/atlas
+  ui/texture/                # TextureStudioScreen (editor completo)
+  ui/theme|components|home|texture3d|studio2dto3d/
+  project/                   # PixelProject + ProjectRepository (contrato)
+app/src/test/                # 78 testes unitários
+.github/workflows/android-release.yml  # CI de release assinado
+docs/formato-osp.md          # especificação do .osp
+docs/spritesheet-atlas-json.md  # esquemas JSON de exportação
+docs/relatorio-fase-0.md     # relatório da Fase 0
+docs/relatorio-fase-1-2.md   # relatório das Fases 1+2
 ```
 
-## Limitações conhecidas (Fase 0)
+## Limitações conhecidas (Fases 1+2)
 
-- Ferramentas de edição, 3D e conversão 2D-para-3D não existem ainda; os ecrãs indicam-no explicitamente.
-- Projetos vivem em memória; guardar/reabrir ficheiros chega com o formato `.osp` numa fase posterior.
+- Não houve ainda validação em dispositivo físico (sem aparelho acessível
+  durante o desenvolvimento); os testes são JVM (incl. Robolectric) e a
+  compilação/assinatura é validada no GitHub Actions.
+- Sem camadas, seleção/recorte, importação de referências ou animação no editor.
+- O "Guardar como" via SAF escreve uma cópia; se a escrita falhar a meio,
+  o destino pode ficar parcial (o projeto interno permanece intacto).
+- 3D e conversão 2D-para-3D não existem ainda; os ecrãs indicam-no explicitamente.
 - Instalação em dispositivo físico requer autorização de fontes desconhecidas (sideload).
 
 ## Próximas fases (indicativo)
 
-1. **Fase 1** — Texture Studio: canvas de pixel art, pincéis, paletas.
-2. **Fase 2** — formato `.osp`, persistência local e gestão de projetos.
-3. **Fase 3** — 3D Texture Studio com OpenGL ES e mapeamento UV.
-4. **Fase 4** — 2D-to-3D Studio com construção assistida.
+1. **Fase 3** — 3D Texture Studio: OpenGL ES, importação de modelos e mapeamento UV.
+2. **Fase 4** — 2D-to-3D Studio: construção geométrica assistida com referências ortográficas.
+3. Fase 5 (sugestões no relatório): camadas, seleção/recorte, animação, testes em dispositivo.
