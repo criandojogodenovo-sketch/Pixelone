@@ -1,6 +1,8 @@
 package com.pixelone.studio.pixel
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -27,10 +29,10 @@ class HistoryManagerTest {
         hist.commitStroke(doc)
 
         assertEquals(0xFFFF0000.toInt(), doc.get(2, 2))
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
         assertEquals(0xFF202020.toInt(), doc.get(2, 2))
         assertEquals(antes[2 * 8 + 2], doc.get(2, 2))
-        assertTrue(hist.redo(doc))
+        assertNotNull(hist.redo(doc))
         assertEquals(0xFFFF0000.toInt(), doc.get(2, 2))
     }
 
@@ -47,7 +49,7 @@ class HistoryManagerTest {
         PixelEngine.drawPixel(doc, 2, 2, 0xFF00FF00.toInt(), recorder = hist)
         hist.commitStroke(doc)
 
-        assertTrue(hist.undo(doc)) // remove o verde
+        assertNotNull(hist.undo(doc)) // remove o verde
         assertEquals(1, hist.redoCount())
 
         // Nova edição → redo limpo
@@ -56,7 +58,7 @@ class HistoryManagerTest {
         hist.commitStroke(doc)
         assertEquals(0, hist.redoCount())
         assertFalse(hist.canRedo())
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
         assertEquals(0xFF202020.toInt(), doc.get(3, 3))
         // O verde NÃO voltou: a edição nova limpa a pilha redo (comportamento padrão)
         assertEquals(0xFF202020.toInt(), doc.get(2, 2))
@@ -76,7 +78,7 @@ class HistoryManagerTest {
         hist.commitStroke(doc)
 
         assertEquals("traço inteiro devia ser 1 entrada", 1, hist.undoCount())
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
         // Tudo volta ao estado original com UM undo
         for (y in 0 until 8) for (x in 0 until 8) assertEquals(0xFF202020.toInt(), doc.get(x, y))
     }
@@ -91,7 +93,7 @@ class HistoryManagerTest {
         hist.commitStroke(doc)
 
         assertEquals(1, hist.undoCount())
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
         for (y in 0 until 8) for (x in 0 until 8) assertEquals(0xFF202020.toInt(), doc.get(x, y))
     }
 
@@ -114,7 +116,7 @@ class HistoryManagerTest {
         )
         // E o undo continua funcional
         assertTrue(hist.canUndo())
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
     }
 
     @Test
@@ -126,7 +128,7 @@ class HistoryManagerTest {
         hist.commitStroke(doc)
         assertEquals(1, hist.undoCount())
         assertTrue(hist.memoryBytesUsed() > 1024L) // mantida apesar de exceder
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
         assertEquals(0x00000000.toInt(), doc.get(0, 0))
     }
 
@@ -157,8 +159,8 @@ class HistoryManagerTest {
     fun `undo e redo sem entradas devolvem false`() {
         val doc = docPreenchido()
         val hist = HistoryManager()
-        assertFalse(hist.undo(doc))
-        assertFalse(hist.redo(doc))
+        assertNull(hist.undo(doc))
+        assertNull(hist.redo(doc))
     }
 
     @Test
@@ -190,7 +192,7 @@ class HistoryManagerTest {
         PixelEngine.drawPixel(doc, 7, 7, 0xFF00FF00.toInt(), recorder = hist)
         hist.commitStroke(doc)
 
-        assertTrue(hist.undo(doc))
+        assertNotNull(hist.undo(doc))
         assertEquals(0xFF202020.toInt(), doc.get(0, 0))
         assertEquals(0xFF202020.toInt(), doc.get(7, 7))
         // píxeis médios intactos
