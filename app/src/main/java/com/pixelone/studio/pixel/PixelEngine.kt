@@ -3,6 +3,16 @@ package com.pixelone.studio.pixel
 /**
  * Motor de desenho 2D do Pixel One (Kotlin puro, testável em JVM).
  *
+ * CAMINHO DUPLO (correção de performance):
+ * - Este objeto é o FALLBACK Kotlin e a referência semântica do motor: o
+ *   mesmo comportamento (traço/linha/balde/borracha) é implementado em
+ *   C++17 em app/src/main/cpp/pixelone_engine.cpp para o caminho rápido.
+ * - A UI usa [com.pixelone.studio.pixel.NativeStroke], que prefere o motor
+ *   nativo (UMA chamada JNI por traço completo) e cai para este fallback
+ *   se a biblioteca nativa não estiver disponível (ex.: JVM/Robolectric).
+ * - Todas as funções operam diretamente sobre o buffer direto do
+ *   [PixelDocument] (vista IntBuffer persistente, acessos absolutos).
+ *
  * DECISÃO DE MISTURA DE COR (documentada):
  * - Todas as ferramentas SUBSTITUEM o valor do píxel (incluindo o canal
  *   alpha), sem mistura alfa progressiva. É o comportamento padrão em
@@ -165,7 +175,9 @@ object PixelEngine {
 
         val w = document.width
         val h = document.height
-        val pixels = document.pixelsView()
+        // Acesso direto à vista persistente do buffer do documento
+        // (sem cópias integrais; cada píxel é lido/escrito no sitio).
+        val doc = document
 
         val tr = (target shr 16) and 0xFF
         val tg = (target shr 8) and 0xFF
@@ -214,12 +226,12 @@ object PixelEngine {
         }
 
         fun paint(idx: Int) {
-            val before = pixels[idx]
+            val before = doc.getAt(idx)
             if (before == color) return
             val x = idx % w
             val y = idx / w
             recorder?.onBeforeChange(x, y, before)
-            pixels[idx] = color
+            doc.setAt(idx, color)
             recorder?.onChanged(x, y)
         }
 
@@ -236,22 +248,22 @@ object PixelEngine {
             // Vizinhos 4-conectados (padrão de editores de pixel art),
             // sem alocação de array por píxel.
             val left = idx - 1
-            if (x > 0 && matches(pixels[left])) {
+            if (x > 0 && matches(doc.getAt(left))) {
                 paint(left)
                 enqueue(left)
             }
             val right = idx + 1
-            if (x < w - 1 && matches(pixels[right])) {
+            if (x < w - 1 && matches(doc.getAt(right))) {
                 paint(right)
                 enqueue(right)
             }
             val up = idx - w
-            if (y > 0 && matches(pixels[up])) {
+            if (y > 0 && matches(doc.getAt(up))) {
                 paint(up)
                 enqueue(up)
             }
             val down = idx + w
-            if (y < h - 1 && matches(pixels[down])) {
+            if (y < h - 1 && matches(doc.getAt(down))) {
                 paint(down)
                 enqueue(down)
             }

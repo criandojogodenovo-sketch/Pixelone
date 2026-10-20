@@ -1,24 +1,44 @@
 package com.pixelone.studio.pixel
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.IntBuffer
+
 /**
  * Documento 2D do Pixel One: um buffer RGBA de 32 bits por píxel
- * (formato ARGB, igual ao formato "color int" do Android), row-major.
+ * (formato int ARGB 0xAARRGGBB, igual ao "color int" do Android), row-major.
  *
- * DECISÃO DE ARQUITETURA (Fases 1+2):
- * - Esta classe é Kotlin PURO (sem dependências Android) para que todo o
- *   motor de desenho seja testável em JVM sem dispositivo nem Robolectric.
- * - A cor de cada píxel é um Int ARGB: 0xAARRGGBB. Transparência real é
- *   suportada (alpha 0x00 = totalmente transparente).
- * - O tamanho LÓGICO da imagem ([width] x [height]) é independente do
- *   tamanho VISUAL do canvas no ecrã (tratado pela camada de UI/câmera).
+ * DECISÃO DE ARQUITETURA (correção de performance):
+ * - Os píxeis vivem num ÚNICO ByteBuffer.allocateDirect(), partilhado entre
+ *   Kotlin e C++17 via JNI (GetDirectBufferAddress no lado nativo). Este
+ *   buffer direto é a FONTE DE VERDADE dos píxeis — não existe IntArray
+ *   duplicado como segundo documento principal.
+ * - FORMATO BINÁRIO (documentado — ver docs/buffer-formato.md):
+ *     · cada píxel = 4 bytes que codificam o uint32 0xAARRGGBB;
+ *     · ordem de bytes: LITTLE-ENDIAN (ByteOrder.nativeOrder() do Android,
+ *       que é little-endian em ARM/x86) — em memória: B,G,R,A por píxel;
+ *     · disposição: row-major, índice = y * width + x;
+ *     · stride = width * 4 bytes (compacto, sem padding).
+ * - O acesso Kotlin usa UMA vista IntBuffer persistente (criada uma vez no
+ *   construtor) com acessos ABSOLUTOS (put/get por índice) — nunca se cria
+ *   uma vista nova por píxel nem por evento de toque.
+ * - VIDA ÚTIL: o buffer vive enquanto o PixelDocument viver; o lado nativo
+ *   NÃO guarda ponteiros entre chamadas (o endereço é obtido por chamada
+ *   JNI e a chamada é síncrona), pelo que a vida útil do buffer excede
+ *   sempre o trabalho nativo que o utiliza.
+ * - A classe é Kotlin puro + java.nio (sem APIs Android) — o motor e o
+ *   histórico continuam totalmente testáveis em JVM.
  *
  * LIMITES E PROTEÇÃO CONTRA ALOCAÇÕES EXCESSIVAS:
  * - Dimensões válidas: 1..[MAX_DIMENSION] por eixo.
- * - Número máximo de píxeis: [MAX_PIXELS] (4 194 304 = 2048x2048), o que
- *   corresponde a ~16 MB por buffer RGBA — orçamento seguro para um
- *   telemóvel de ~4 GB de RAM mesmo com snapshots do histórico.
+ * - Número máximo de píxeis: [MAX_PIXELS] (2048x2048 = 4 194 304), ou seja
+ *   ~16 MB por buffer direto — orçamento seguro para telemóveis de ~4 GB.
  * - Qualquer violação lança [IllegalArgumentException] ANTES de qualquer
- *   alocação de memória (validação no construtor).
+ *   alocação (validação no construtor).
+ *
+ * COMPATIBILIDADE: o formato .osp (bytes RGBA sem perdas) e a exportação
+ * PNG mantêm-se exatamente iguais — a migração para buffer direto não
+ * altera nenhum ficheiro guardado nem píxel exportado.
  */
 class PixelDocument(
     val width: Int,
@@ -38,43 +58,96 @@ class PixelDocument(
         }
     }
 
-    /** Buffer ARGB row-major; índice = y * width + x. */
-    private val buffer: IntArray =
-        if (initialPixels != null) {
-            require(initialPixels.size == width * height) {
-                "Buffer inicial tem ${initialPixels.size} valores; esperado ${width * height}"
-            }
-            initialPixels.copyOf()
-        } else {
-            IntArray(width * height) // 0x00000000 = totalmente transparente
-        }
+    /**
+     * Buffer direto = fonte de verdade dos píxeis (partilhado com o C++
+     * através de JNI). Ordem de bytes nativa (little-endian no Android),
+     * capacidade exata width * height * 4.
+     */
+    val sharedBuffer: ByteBuffer =
+        ByteBuffer.allocateDirect(width * height * 4) // ≤ 16 MB (MAX_PIXELS garantido no init)
+            .order(ByteOrder.nativeOrder())
+
+    /** Vista IntBuffer persistente sobre [sharedBuffer] — criada UMA vez. */
+    private val intView: IntBuffer = sharedBuffer.asIntBuffer()
 
     val pixelCount: Int get() = width * height
+
+    init {
+        if (initialPixels != null) {
+            require(initialPixels.size == pixelCount) {
+                "Buffer inicial tem ${initialPixels.size} valores; esperado $pixelCount"
+            }
+            // Cópia em bloco para o buffer direto (uma operação, sem loop por píxel).
+            intView.rewind()
+            intView.put(initialPixels)
+        }
+        // allocateDirect já entrega memória zeroed = 0x00000000 (transparente).
+    }
 
     /** Devolve true se (x, y) está dentro dos limites do documento. */
     fun inBounds(x: Int, y: Int): Boolean = x in 0 until width && y in 0 until height
 
+    /** Devolve true se o índice linear está dentro dos limites do buffer. */
+    fun inBoundsIndex(index: Int): Boolean = index in 0 until pixelCount
+
     /** Cor ARGB do píxel (x, y); devolve 0 se fora dos limites. */
     fun get(x: Int, y: Int): Int =
-        if (inBounds(x, y)) buffer[y * width + x] else 0
+        if (inBounds(x, y)) intView.get(y * width + x) else 0
 
     /**
      * Define a cor ARGB do píxel (x, y). Fora dos limites é ignorado
      * silenciosamente (as ferramentas validam antes; isto é uma proteção).
      */
     fun set(x: Int, y: Int, argb: Int) {
-        if (inBounds(x, y)) buffer[y * width + x] = argb
+        if (inBounds(x, y)) intView.put(y * width + x, argb)
+    }
+
+    /** Cor ARGB do píxel no índice linear [index]; 0 se fora dos limites. */
+    fun getAt(index: Int): Int =
+        if (inBoundsIndex(index)) intView.get(index) else 0
+
+    /** Define a cor ARGB no índice linear [index]; fora dos limites ignora. */
+    fun setAt(index: Int, argb: Int) {
+        if (inBoundsIndex(index)) intView.put(index, argb)
     }
 
     /**
-     * Vista do buffer interno para operações regionais do motor (fill,
-     * histórico, composição). Evita cópias completas do bitmap por evento
-     * de toque — o acesso direto é a base da eficiência do editor.
+     * Validação completa usada antes de qualquer operação nativa: o buffer
+     * é direto, tem a capacidade esperada e as dimensões não transbordam.
+     * Devolve a razão do erro (para diagnóstico) ou null se estiver correto.
      */
-    fun pixelsView(): IntArray = buffer
+    fun bufferValidationProblem(): String? {
+        if (!sharedBuffer.isDirect) return "O buffer de píxeis não é direto"
+        val expected = width.toLong() * height.toLong() * 4L
+        val capacity = sharedBuffer.capacity().toLong()
+        if (capacity != expected) {
+            return "Capacidade do buffer ($capacity) != esperado ($expected)"
+        }
+        if (width <= 0 || height <= 0) return "Dimensões inválidas: ${width}x$height"
+        return null
+    }
 
-    /** Cópia completa do documento (usada em testes e comparações). */
-    fun copyPixels(): IntArray = buffer.copyOf()
+    /** Cópia completa do documento em IntArray (snapshots, testes, exportação). */
+    fun copyPixels(): IntArray {
+        val out = IntArray(pixelCount)
+        // Cópia em bloco: vista duplicada na posição 0 → bulk get.
+        sharedBuffer.duplicate().order(sharedBuffer.order()).asIntBuffer().get(out)
+        return out
+    }
+
+    /**
+     * DEPRECIADO (transição): devolve uma CÓPIA integral — o caminho novo
+     * opera diretamente sobre o buffer direto ([getAt]/[setAt]/[copyRegionInto]).
+     * Mantido apenas para os chamadores ainda não migrados; será removido.
+     */
+    @Deprecated(
+        message = "Use o buffer direto (sharedBuffer) ou cópias explícitas (copyPixels)",
+        replaceWith = ReplaceWith("copyPixels()")
+    )
+    fun pixelsView(): IntArray = copyPixels()
+
+    /** Alias semântico de [copyPixels]. */
+    fun toIntArray(): IntArray = copyPixels()
 
     /** Copia a região [x0..x1] x [y0..y1] (inclusive, recortada aos limites) para um novo array. */
     fun copyRegion(x0: Int, y0: Int, x1: Int, y1: Int): IntArray {
@@ -86,10 +159,24 @@ class PixelDocument(
         val rw = cx1 - cx0 + 1
         val rh = cy1 - cy0 + 1
         val out = IntArray(rw * rh)
-        for (row in 0 until rh) {
-            System.arraycopy(buffer, (cy0 + row) * width + cx0, out, row * rw, rw)
-        }
+        copyRegionInto(cx0, cy0, rw, rh, out)
         return out
+    }
+
+    /**
+     * Copia a região (x0, y0, rw x rh — já recortada aos limites) para
+     * [out] SEM alocação adicional — usada na atualização regional do
+     * Bitmap de apresentação (evita arrays temporários por evento).
+     */
+    fun copyRegionInto(x0: Int, y0: Int, rw: Int, rh: Int, out: IntArray) {
+        require(out.size >= rw * rh) { "Array de destino demasiado pequeno" }
+        var o = 0
+        for (row in 0 until rh) {
+            val base = (y0 + row) * width + x0
+            for (col in 0 until rw) {
+                out[o++] = intView.get(base + col)
+            }
+        }
     }
 
     /** Escreve [region] (row-major) começando em (x0, y0), com recorte aos limites. */
@@ -101,22 +188,23 @@ class PixelDocument(
             for (col in 0 until regionWidth) {
                 val x = x0 + col
                 val y = y0 + row
-                if (inBounds(x, y)) buffer[y * width + x] = region[row * regionWidth + col]
+                if (inBounds(x, y)) intView.put(y * width + x, region[row * regionWidth + col])
             }
         }
     }
 
-    /** Cria um novo documento independente com os mesmos píxeis. */
-    fun deepCopy(): PixelDocument = PixelDocument(width, height, buffer)
+    /** Cria um novo documento independente com os mesmos píxeis (buffer direto novo). */
+    fun deepCopy(): PixelDocument = PixelDocument(width, height, copyPixels())
 
     /** Codifica os píxeis em bytes RGBA (R,G,B,A) — formato usado no ficheiro .osp. */
     fun toRgbaBytes(): ByteArray {
-        val out = ByteArray(pixelCount * 4)
+        val pixels = copyPixels() // cópia em bloco do buffer direto
+        val out = ByteArray(pixels.size * 4)
         var o = 0
-        for (argb in buffer) {
-            out[o] = ((argb shr 16) and 0xFF).toByte() // R
-            out[o + 1] = ((argb shr 8) and 0xFF).toByte() // G
-            out[o + 2] = (argb and 0xFF).toByte() // B
+        for (argb in pixels) {
+            out[o] = ((argb shr 16) and 0xFF).toByte()      // R
+            out[o + 1] = ((argb shr 8) and 0xFF).toByte()   // G
+            out[o + 2] = (argb and 0xFF).toByte()           // B
             out[o + 3] = ((argb ushr 24) and 0xFF).toByte() // A
             o += 4
         }
