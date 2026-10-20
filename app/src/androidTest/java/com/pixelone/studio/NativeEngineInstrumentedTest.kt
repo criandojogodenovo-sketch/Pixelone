@@ -132,8 +132,9 @@ class NativeEngineInstrumentedTest {
         }
         assertEquals(0xFF111111.toInt(), byIndex[2 * 32 + 2]!!.first)
         assertEquals(0xFF222222.toInt(), byIndex[2 * 32 + 2]!!.second)
-        assertEquals(0, byIndex[3 * 32 + 2]!!.first)
-        assertEquals(0xFF222222.toInt(), byIndex[4 * 32 + 2]!!.second)
+        // (3,2) e (4,2) ⇒ índice linear y*32+x = 2*32+3 e 2*32+4
+        assertEquals(0, byIndex[2 * 32 + 3]!!.first)
+        assertEquals(0xFF222222.toInt(), byIndex[2 * 32 + 4]!!.second)
     }
 
     @Test
