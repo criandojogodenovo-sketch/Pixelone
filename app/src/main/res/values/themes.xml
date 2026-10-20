@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tema da janela: escuro fixo, coerente com a identidade Pixel One.
+         O conteúdo real é desenhado pelo Jetpack Compose (PixelOneTheme);
+         este tema cobre apenas a janela antes do primeiro frame e as system bars. -->
+    <style name="Theme.PixelOne" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+</resources>

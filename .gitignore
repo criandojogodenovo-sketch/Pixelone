@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# SDK / Android Studio
+local.properties
+.cxx/
+.externalNativeBuild/
+captures/
+
+# Material de assinatura — NUNCA versionar segredos ou keystores
+*.jks
+*.keystore
+keystore.properties
+secrets.properties
+
+# Sistema
+.DS_Store

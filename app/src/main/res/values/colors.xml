@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Identidade visual Pixel One: preto, cinzento e laranja. -->
+    <color name="window_background">#0A0A0A</color>
+    <color name="ic_launcher_background">#141414</color>
+</resources>
