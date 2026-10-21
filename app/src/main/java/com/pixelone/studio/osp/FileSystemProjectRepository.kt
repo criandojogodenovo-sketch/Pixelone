@@ -96,11 +96,13 @@ class FileSystemProjectRepository(
         return project
     }
 
-    /** Devolve o projeto, o documento completo e a paleta, ou null se não existir. */
+    /** Devolve o projeto, o documento completo, a paleta e a secção 3D (opcional). */
     data class LoadedProjectData(
         val project: PixelProject,
         val document: PixelDocument,
-        val palette: List<String>?
+        val palette: List<String>?,
+        /** Conteúdo de studio3d.json (v2), ou null em projetos v1/sem 3D. */
+        val studio3dJson: String? = null
     )
 
     fun loadProject(id: String): LoadedProjectData? {
@@ -108,7 +110,7 @@ class FileSystemProjectRepository(
         if (!file.exists()) return null
         val loaded = OspCodec.load(file.inputStream().buffered())
         val project = loaded.manifest.toProject(id)
-        return LoadedProjectData(project, loaded.document, loaded.manifest.palette)
+        return LoadedProjectData(project, loaded.document, loaded.manifest.palette, loaded.studio3dJson)
     }
 
     /**
@@ -117,13 +119,16 @@ class FileSystemProjectRepository(
      * (updatedAtEpochMs novo).
      *
      * @param palette paleta opcional em hex ARGB (#AARRGGBB) para o manifesto.
+     * @param studio3dJson conteúdo JSON opcional da secção 3D do projeto (v2;
+     *        ver Studio3DState) — guardada como studio3d.json quando não nula.
      * @throws IOException em falha de escrita/validação (o ficheiro anterior
      *         permanece intacto).
      */
     fun saveDocument(
         project: PixelProject,
         document: PixelDocument,
-        palette: List<String>? = null
+        palette: List<String>? = null,
+        studio3dJson: String? = null
     ): PixelProject {
         require(project.id.isNotBlank()) { "id do projeto vazio" }
         val finalFile = File(projectsDir, "${project.id}.osp")
@@ -140,13 +145,14 @@ class FileSystemProjectRepository(
         )
 
         try {
-            OspCodec.save(manifest, document, tmpFile.outputStream().buffered())
+            OspCodec.save(manifest, document, tmpFile.outputStream().buffered(), studio3dJson)
             // Validação de roundtrip ANTES de substituir o ficheiro final.
             val reloaded = OspCodec.load(tmpFile.inputStream().buffered())
             require(reloaded.document.width == document.width &&
                 reloaded.document.height == document.height &&
                 reloaded.document.copyPixels().contentEquals(document.copyPixels())
             ) { "Validação de roundtrip falhou" }
+            require(reloaded.studio3dJson == studio3dJson) { "Roundtrip da secção 3D falhou" }
         } catch (e: Exception) {
             tmpFile.delete()
             throw IOException("Falha ao guardar o projeto '${updated.name}': ${e.message}", e)

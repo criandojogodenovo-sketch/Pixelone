@@ -1,52 +1,544 @@
 package com.pixelone.studio.ui.texture3d
 
+import android.view.GestureDetector
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.opengl.GLSurfaceView
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
-import com.pixelone.studio.ui.components.PlannedPanel
-import com.pixelone.studio.ui.components.ReservedCanvasArea
-import com.pixelone.studio.ui.components.SectionTitle
-import com.pixelone.studio.ui.components.StatusBadge
-import com.pixelone.studio.ui.components.StudioScreenScaffold
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.Observer
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.pixelone.studio.studio3d.GltfLimits
+import com.pixelone.studio.studio3d.Studio3DState.SamplingMode
+import com.pixelone.studio.studio3d.Studio3DState.StudioMode
+import com.pixelone.studio.studio3d.Studio3DViewModel
+import com.pixelone.studio.studio3d.gl.ModelRenderer
+import com.pixelone.studio.ui.theme.PixelBlack
+import com.pixelone.studio.ui.theme.PixelGray
+import com.pixelone.studio.ui.theme.PixelGrayBorder
+import com.pixelone.studio.ui.theme.PixelGrayLight
+import com.pixelone.studio.ui.theme.PixelOrange
+import com.pixelone.studio.ui.theme.PixelSurface
+import com.pixelone.studio.ui.theme.PixelSurfaceElevated
 
 /**
- * 3D Texture Studio — espaço planeado da Fase 0.
- * O renderer 3D e o mapeamento UV NÃO estão implementados nesta fase.
+ * 3D Texture Studio — FASE 3 (substitui o placeholder da Fase 0).
+ *
+ * LAYOUT vertical Android (regra do pedido):
+ *  - topo (~48 dp): voltar, nome do projeto, importar, menu;
+ *  - seletor de modo (~52 dp): 3D | UV | Dividido (UV/Dividido bloqueados e
+ *    explicados quando o modelo não tem UV);
+ *  - área principal (peso ~55–60%): viewport 3D / vista UV / modo Dividido;
+ *  - painel inferior (~170 dp, recolhível com um toque): muda por modo;
+ *  - barra de navegação (~56 dp): Texture / 3D / 2D→3D.
+ *
+ * Ao abrir: modelo de demonstração + textura demo JÁ visíveis (requisito —
+ * sem passos escondidos). Nenhum menu cobre o viewport inteiro.
  */
 @Composable
-fun Texture3DStudioScreen(onBack: () -> Unit) {
-    StudioScreenScaffold(title = "3D Texture Studio", onBack = onBack) {
-        StatusBadge(text = "FASE 0 - PLANEADO")
-        Spacer(modifier = Modifier.height(16.dp))
+fun Texture3DStudioScreen(
+    onBack: () -> Unit,
+    onOpenTextureStudio: () -> Unit = {},
+    onOpen2Dto3D: () -> Unit = {}
+) {
+    val viewModel: Studio3DViewModel = viewModel()
 
-        SectionTitle("Estado atual")
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = "O 3D Texture Studio permitirá aplicar texturas criadas no Texture Studio " +
-                "a modelos 3D através dos seus UVs. Nesta fase, o espaço existe como base de " +
-                "navegação: o carregamento de modelos, o mapeamento UV e a pintura de texturas " +
-                "sobre modelos 3D ainda não foram implementados. A visualização futura usará " +
-                "OpenGL ES.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+    // --------------------------- estado local de UI ------------------------
+    var showMenu by remember { mutableStateOf(false) }
+    var showNewTextureDialog by remember { mutableStateOf(false) }
+    var showOpenProjectDialog by remember { mutableStateOf(false) }
+    var panelExpanded by remember { mutableStateOf(true) }
 
-        Spacer(modifier = Modifier.height(16.dp))
-        ReservedCanvasArea(label = "Área reservada para a vista 3D (OpenGL ES)")
+    val mode by viewModel.mode.observeAsLocalState()
+    val projectName by viewModel.projectName.observeAsLocalState()
+    val hasUnsaved by viewModel.hasUnsavedChanges.observeAsLocalState()
 
-        Spacer(modifier = Modifier.height(16.dp))
-        PlannedPanel(
-            items = listOf(
-                "Importação de modelos 3D",
-                "Mapeamento e edição de UVs",
-                "Pintura de texturas sobre o modelo",
-                "Visualização com OpenGL ES"
-            )
-        )
-        Spacer(modifier = Modifier.height(24.dp))
+    val snackbarHostState = remember { SnackbarHostState() }
+    // Mensagens: observação simples com consumidor único.
+    var lastShownStatus by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        viewModel.statusMessage.observeForever { msg ->
+            if (msg != null && msg != lastShownStatus) {
+                lastShownStatus = msg
+            }
+        }
     }
+    LaunchedEffect(lastShownStatus) {
+        lastShownStatus?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.statusMessage.value = null
+            lastShownStatus = null
+        }
+    }
+
+    // --------------------------- importação SAF ----------------------------
+    val importModelLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) viewModel.importModelFromUri(uri)
+    }
+
+    // --------------------------- retorno com guarda ------------------------
+    BackHandler {
+        onBack()
+    }
+
+    // Volta do Texture Studio: adota a textura atualizada (requisito: o 3D
+    // atualiza quando a textura muda, sem reiniciar o projeto).
+    DisposableEffect(Unit) {
+        viewModel.adoptFromStudio2D()
+        onDispose { }
+    }
+
+    Box(Modifier.fillMaxSize().background(PixelBlack)) {
+        Column(Modifier.fillMaxSize()) {
+
+            // ---------------------- topo (~6%) -----------------------------
+            Surface(color = PixelSurface, tonalElevation = 2.dp) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar", tint = PixelGrayLight)
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = projectName ?: "3D Texture Studio",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = PixelGrayLight,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = if (hasUnsaved) "alterações por guardar" else "projeto 3D",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (hasUnsaved) PixelOrange else PixelGray
+                        )
+                    }
+                    IconButton(
+                        onClick = { importModelLauncher.launch(arrayOf("*/*")) },
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Icon(Icons.Default.Add, "Importar modelo glTF/GLB", tint = PixelOrange)
+                    }
+                    Box {
+                        IconButton(onClick = { showMenu = true }, modifier = Modifier.size(48.dp)) {
+                            Icon(Icons.Default.Menu, "Menu", tint = PixelGrayLight)
+                        }
+                        Studio3DMenu(
+                            expanded = showMenu,
+                            onDismiss = { showMenu = false },
+                            viewModel = viewModel,
+                            onOpenProjects = {
+                                showMenu = false
+                                showOpenProjectDialog = true
+                            },
+                            onNewTexture = {
+                                showMenu = false
+                                showNewTextureDialog = true
+                            }
+                        )
+                    }
+                }
+            }
+
+            // ---------------------- seletor de modo (~7%) -------------------
+            ModeSelector(viewModel = viewModel, mode = mode)
+
+            // ---------------------- área principal (55–60%) -----------------
+            when (mode) {
+                StudioMode.THREE_D -> ThreeDMode(viewModel)
+                StudioMode.UV -> UvMode(viewModel)
+                StudioMode.SPLIT -> SplitMode(viewModel)
+            }
+
+            // ---------------------- painel inferior (~20%) ------------------
+            BottomPanel(
+                viewModel = viewModel,
+                mode = mode,
+                expanded = panelExpanded,
+                onToggle = { panelExpanded = !panelExpanded },
+                onPaintTexture = {
+                    viewModel.publishTextureToStudio2D()
+                    onOpenTextureStudio()
+                }
+            )
+
+            // ---------------------- barra de navegação (~6%) ----------------
+            Studio3DBottomNav(
+                onOpenTextureStudio = onOpenTextureStudio,
+                onOpen2Dto3D = onOpen2Dto3D
+            )
+        }
+
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 200.dp)
+        )
+    }
+
+    if (showNewTextureDialog) {
+        NewTextureDialog(
+            onDismiss = { showNewTextureDialog = false },
+            onCreate = { name, w, h ->
+                showNewTextureDialog = false
+                viewModel.newTexture(name, w, h)
+            }
+        )
+    }
+    if (showOpenProjectDialog) {
+        OpenProjectDialog(
+            viewModel = viewModel,
+            onDismiss = { showOpenProjectDialog = false }
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Observação de LiveData sem dependência extra (runtime-livedata não está no BOM)
+// ---------------------------------------------------------------------------
+
+@Suppress("UNCHECKED_CAST")
+@Composable
+fun <T> MutableLiveData<T>.observeAsLocalState(): androidx.compose.runtime.State<T> {
+    val state = androidx.compose.runtime.remember { mutableStateOf(value) }
+    DisposableEffect(this) {
+        val observer = Observer<T> { state.value = it }
+        observeForever(observer)
+        onDispose { removeObserver(observer) }
+    }
+    return state as androidx.compose.runtime.State<T>
+}
+
+// ---------------------------------------------------------------------------
+// Menu (⋮): guardar, abrir, nova textura, modelo demo, textura do 2D
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun Studio3DMenu(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    viewModel: Studio3DViewModel,
+    onOpenProjects: () -> Unit,
+    onNewTexture: () -> Unit
+) {
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        DropdownMenuItem(
+            text = { Text("Guardar projeto") },
+            onClick = { onDismiss(); viewModel.saveProject() }
+        )
+        DropdownMenuItem(
+            text = { Text("Abrir projeto…") },
+            onClick = onOpenProjects
+        )
+        DropdownMenuItem(
+            text = { Text("Nova textura…") },
+            onClick = onNewTexture
+        )
+        DropdownMenuItem(
+            text = { Text("Usar geometria de demonstração") },
+            onClick = { onDismiss(); viewModel.useDemoModel() }
+        )
+        DropdownMenuItem(
+            text = { Text("Aplicar textura do Texture Studio") },
+            onClick = {
+                onDismiss()
+                if (!viewModel.adoptFromStudio2D()) {
+                    viewModel.statusMessage.value =
+                        "Sem textura nova do Texture Studio — pinta uma e volta ao 3D"
+                }
+            }
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seletor de modo: 3D | UV | Dividido (com bloqueio sem UV)
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun ModeSelector(viewModel: Studio3DViewModel, mode: StudioMode) {
+    val hasUv = viewModel.model.hasUv
+    Surface(color = PixelSurfaceElevated) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 8.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            ModeChip("3D", mode == StudioMode.THREE_D, Modifier.weight(1f)) {
+                viewModel.setMode(StudioMode.THREE_D)
+            }
+            ModeChip("UV", mode == StudioMode.UV, Modifier.weight(1f), enabled = hasUv) {
+                viewModel.setMode(StudioMode.UV)
+            }
+            ModeChip("Dividido", mode == StudioMode.SPLIT, Modifier.weight(1f), enabled = hasUv) {
+                viewModel.setMode(StudioMode.SPLIT)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModeChip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .height(36.dp)
+            .background(if (selected) PixelOrange else PixelSurface)
+            .border(
+                width = 1.dp,
+                color = when {
+                    selected -> PixelOrange
+                    !enabled -> PixelGrayBorder
+                    else -> PixelGray
+                },
+                shape = MaterialTheme.shapes.small
+            )
+            .clickable(enabled = enabled) {
+                onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = when {
+                selected -> Color.Black
+                !enabled -> PixelGray.copy(alpha = 0.5f)
+                else -> PixelGrayLight
+            }
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modo 3D: viewport + botão repor câmara + faixa de materiais
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun ThreeDMode(viewModel: Studio3DViewModel) {
+    Box(Modifier.fillMaxWidth().fillMaxHeight(0.58f)) {
+        Studio3DGlViewport(viewModel, Modifier.fillMaxSize())
+
+        // Botão "Repor câmara" (requisito) — overlay, não cobre o viewport.
+        Surface(
+            color = PixelSurfaceElevated.copy(alpha = 0.9f),
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.clickable { viewModel.resetCamera() }.padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null, tint = PixelOrange, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Repor câmara", style = MaterialTheme.typography.labelMedium, color = PixelGrayLight)
+            }
+        }
+
+        // Faixa horizontal de miniaturas de materiais (requisito do modo 3D).
+        val selectedMaterial by viewModel.selectedMaterial.observeAsLocalState()
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .background(PixelSurfaceElevated.copy(alpha = 0.92f))
+                .padding(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            viewModel.model.materials.forEachIndexed { index, material ->
+                val selected = index == selectedMaterial
+                Column(
+                    modifier = Modifier
+                        .width(84.dp)
+                        .background(PixelSurface)
+                        .border(
+                            1.dp,
+                            if (selected) PixelOrange else PixelGrayBorder,
+                            MaterialTheme.shapes.small
+                        )
+                        .clickable { viewModel.selectMaterial(index) }
+                        .padding(6.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        Modifier
+                            .size(24.dp)
+                            .background(
+                                Color(
+                                    (material.baseColorFactor[0] * 255).toInt(),
+                                    (material.baseColorFactor[1] * 255).toInt(),
+                                    (material.baseColorFactor[2] * 255).toInt(),
+                                    (material.baseColorFactor[3] * 255).toInt()
+                                )
+                            )
+                            .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        material.name,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = PixelGrayLight,
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Viewport GL (GLSurfaceView) + gestos: 1 dedo roda; 2 dedos zoom e deslocam
+// ---------------------------------------------------------------------------
+
+@Composable
+internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val renderer = remember { ModelRenderer(viewModel.camera) }
+
+    val glView = remember {
+        GLSurfaceView(context).apply {
+            setEGLContextClientVersion(3) // ES 3.0: índices uint, universal em minSdk 26
+            setRenderer(renderer)
+            renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+
+            var lastX = 0f
+            var lastY = 0f
+            var panning = false
+            val scaleDetector = ScaleGestureDetector(
+                context,
+                object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                    override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                        panning = false
+                        return true
+                    }
+
+                    override fun onScale(detector: ScaleGestureDetector): Boolean {
+                        viewModel.camera.zoom(detector.scaleFactor)
+                        return true
+                    }
+                }
+            )
+            setOnTouchListener { v, e ->
+                when (e.pointerCount) {
+                    1 -> when (e.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            lastX = e.x; lastY = e.y; panning = true
+                            true
+                        }
+                        MotionEvent.ACTION_MOVE -> {
+                            // 1 dedo = RODAR a câmara (requisito).
+                            viewModel.camera.rotate(e.x - lastX, e.y - lastY)
+                            lastX = e.x; lastY = e.y
+                            true
+                        }
+                        else -> true
+                    }
+                    else -> {
+                        // 2 dedos = zoom (pinça) + deslocamento (requisito).
+                        scaleDetector.onTouchEvent(e)
+                        if (e.actionMasked == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress) {
+                            val cx = (e.getX(0) + e.getX(1)) / 2f
+                            val cy = (e.getY(0) + e.getY(1)) / 2f
+                            if (panning) {
+                                viewModel.camera.pan(cx - lastX, cy - lastY, height)
+                            }
+                            lastX = cx; lastY = cy
+                        } else if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+                            lastX = (e.getX(0) + e.getX(1)) / 2f
+                            lastY = (e.getY(0) + e.getY(1)) / 2f
+                            panning = true
+                        }
+                        true
+                    }
+                }.also { v.performClick() }
+            }
+        }
+    }
+
+    // Liga o renderer ao ViewModel (envia cena + textura atuais).
+    LaunchedEffect(renderer) {
+        viewModel.attachRenderer(renderer)
+    }
+
+    // Pausa/retoma do GL quando a app vai para segundo plano.
+    DisposableEffect(lifecycleOwner, glView) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> glView.onPause()
+                Lifecycle.Event.ON_RESUME -> glView.onResume()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.attachRenderer(null)
+            renderer.release()
+            glView.onPause()
+        }
+    }
+
+    AndroidView(
+        factory = { glView },
+        modifier = modifier
+    )
 }

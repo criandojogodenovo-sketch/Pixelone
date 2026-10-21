@@ -44,6 +44,7 @@ import java.nio.IntBuffer
 import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
+import com.pixelone.studio.studio3d.StudioSharedBus
 
 /**
  * Estado e lógica do editor de pixel art (Fase 1 + correções de
@@ -328,6 +329,50 @@ class EditorViewModel(app: Application) : AndroidViewModel(app), DefaultLifecycl
         hasUnsavedChanges.value = true
         showMessage("Novo projeto: $name (${width}x$height)")
         onReady()
+    }
+
+    /**
+     * FASE 3 — "Pintar esta textura": adota a textura publicada pelo 3D
+     * Texture Studio (StudioSharedBus) como documento atual. O conteúdo é
+     * cópia própria (sem referências vivas entre ViewModels); fica marcado
+     * com alterações não guardadas — o utilizador decide guardar.
+     */
+    fun adoptSharedTexture(handoff: StudioSharedBus.TextureHandoff, onReady: () -> Unit) {
+        autosaveIfNeeded()
+        installDocument(
+            doc = PixelDocument(handoff.width, handoff.height, handoff.pixels),
+            project = null,
+            palette = palette.value,
+            projectName = handoff.name
+        )
+        hasUnsavedChanges.value = true
+        showMessage(
+            "Textura do 3D Studio: ${handoff.name} (${handoff.width}x${handoff.height})"
+        )
+        onReady()
+    }
+
+    /**
+     * FASE 3 — publica a textura atual no bus para o 3D Texture Studio
+     * adotar ao voltar (chamada no onDispose do ecrã e no autosave).
+     * Não altera o estado do editor — apenas copia píxeis para o bus.
+     */
+    fun publishCurrentTextureToBus() {
+        val d = document ?: return
+        try {
+            StudioSharedBus.publishFrom2D(
+                StudioSharedBus.TextureHandoff(
+                    name = currentProjectName,
+                    width = d.width,
+                    height = d.height,
+                    pixels = d.copyPixels(),
+                    uvSegments = null,
+                    version = System.nanoTime()
+                )
+            )
+        } catch (_: Exception) {
+            // O bus é um canal best-effort: nunca pode quebrar o editor 2D.
+        }
     }
 
     /** Lista os projetos guardados (para a folha "Abrir"). */

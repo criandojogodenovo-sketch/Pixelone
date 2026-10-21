@@ -308,4 +308,24 @@ object MiniJson {
                 ?: throw JsonParseException("Campo '$key' só pode conter strings", -1)
         }
     }
+
+    /** Lê um campo opcional como Int (Long/Double integral aceites); [default] se ausente. */
+    fun optionalInt(obj: Map<String, Any?>, key: String, default: Int): Int =
+        when (val v = obj[key]) {
+            null -> default
+            is Int -> v
+            is Long -> if (v in Int.MIN_VALUE..Int.MAX_VALUE) v.toInt() else default
+            is Double -> if (v == Math.floor(v) && !v.isInfinite()) v.toInt() else default
+            else -> default
+        }
+
+    /** Lê um campo opcional como Float (Int/Long/Double aceites); [default] se ausente. */
+    fun optionalFloat(obj: Map<String, Any?>, key: String, default: Float): Float =
+        when (val v = obj[key]) {
+            null -> default
+            is Int -> v.toFloat()
+            is Long -> v.toFloat()
+            is Double -> v.toFloat()
+            else -> default
+        }
 }

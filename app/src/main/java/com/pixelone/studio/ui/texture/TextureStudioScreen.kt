@@ -62,6 +62,7 @@ import com.pixelone.studio.editor.EditorViewModel
 import com.pixelone.studio.editor.PixelIcons
 import com.pixelone.studio.export.PngExport
 import com.pixelone.studio.pixel.PixelEngine
+import com.pixelone.studio.studio3d.StudioSharedBus
 import com.pixelone.studio.ui.editor.ColorPickerDialog
 import com.pixelone.studio.ui.editor.ConfirmDiscardDialog
 import com.pixelone.studio.ui.editor.ExportOptionsDialog
@@ -137,6 +138,9 @@ fun TextureStudioScreen(onBack: () -> Unit) {
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(viewModel)
             viewModel.autosaveIfNeeded()
+            // FASE 3 — publica a textura atual para o 3D Studio adotar ao voltar
+            // (o 3D atualiza quando a textura muda, sem reiniciar o projeto).
+            viewModel.publishCurrentTextureToBus()
         }
     }
 
@@ -153,6 +157,12 @@ fun TextureStudioScreen(onBack: () -> Unit) {
         } else {
             action()
         }
+    }
+
+    // FASE 3 — oferta da textura vinda do 3D Studio ("Pintar esta textura"):
+    // adotada com guarda (nunca perde edições não guardadas sem confirmação).
+    StudioSharedBus.consumeFor2D()?.let { handoff ->
+        guardThen { viewModel.adoptSharedTexture(handoff) {} }
     }
 
     fun handleBack() {
