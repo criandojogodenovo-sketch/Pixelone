@@ -125,6 +125,28 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     /** Malha selecionada na vista UV (null = todas). */
     val selectedMesh = MutableLiveData<Int?>(null)
 
+    // ------------------------------------------------------------------
+    // MISSÃO UI/SELEÇÃO — texturas como objetos selecionáveis
+    // ------------------------------------------------------------------
+
+    /**
+     * Textura SELECIONADA (identidade estável de [TextureCatalog]):
+     * "document" (a do projeto — a única editável) ou "embedded:<i>"
+     * (embutida do GLB — só leitura). Distinta da seleção de material,
+     * malha/objeto e face/ilhas (níveis separados, sincronizados onde faz
+     * sentido — ver [selectTexture]/[selectMaterial]).
+     */
+    val selectedTexture = MutableLiveData(TextureCatalog.DOCUMENT_ID)
+
+    /** Catálogo das texturas do modelo (projeto + embutidas usadas). */
+    val textureCatalog = MutableLiveData<List<TextureEntry>>(emptyList())
+
+    /**
+     * Bitmap mostrado nas vistas UV/Dividido: a textura SELECIONADA —
+     * composição do projeto OU a embutida (só leitura).
+     */
+    val viewTexture = MutableLiveData<Bitmap?>(null)
+
     /**
      * Seleção partilhada pelos painéis 3D e UV (requisito Ronda A: no modo
      * Dividido aparece nos DOIS painéis em simultâneo).
@@ -213,6 +235,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         computeIslands()
         fitCameraToModel()
         postPaintState()
+        postTextureCatalog()
+        postViewTexture()
     }
 
     override fun onCleared() {
@@ -316,6 +340,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Início do traço na vista 2D/UV (texel). Um gesto = UMA entrada. */
     fun paintBegin(x: Int, y: Int) {
+        if (paintBlockedByTextureSelection()) return
         val doc = compositeDoc
         if (!doc.inBounds(x, y)) return
         lastPaintX = x; lastPaintY = y
@@ -368,6 +393,11 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Fim do traço na vista 2D/UV: fecha a entrada única do histórico. */
     fun paintEnd() {
+        if (paintBlockedByTextureSelection()) {
+            lastPaintX = -1; lastPaintY = -1
+            shapeStartX = -1; shapeStartY = -1
+            return
+        }
         val tool = paintState.tool
         val ex = lastPaintX; val ey = lastPaintY
         val sx = shapeStartX; val sy = shapeStartY
@@ -915,6 +945,9 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         this.bindings.value = bindingsOverride
         this.selectedMaterial.value = 0
         this.selectedIsland.value = null
+        // MISSÃO: novo modelo → catálogo de texturas novo; seleção volta ao
+        // projeto (as embutidas antigas deixaram de existir).
+        this.selectedTexture.value = TextureCatalog.DOCUMENT_ID
         lastPickTriangle = -1
         lastPickRenderable = -1
         // Modo pode ter de recuar se o novo modelo não tiver UV.
@@ -928,6 +961,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
             r.setScene(model, embedded, bindingsOverride, sampling.value ?: SamplingMode.NEAREST)
             r.setHighlight(null, null)
         }
+        postTextureCatalog()
+        postViewTexture()
     }
 
     /** Recalcula as ilhas UV por primitiva (apenas primitivas com UV). */
@@ -1060,6 +1095,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Operação discreta (balde/conta-gotas) por raio 3D (Ronda B). */
     fun discreteAtNdc(ndcX: Float, ndcY: Float, aspect: Float): Boolean {
+        if (paintBlockedByTextureSelection()) return false
         val ray = MeshPicking.rayFromNdc(camera, ndcX, ndcY, aspect)
         val hit = pickCached(model, ray)
         if (hit == null) return false
@@ -1144,6 +1180,9 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         bindings.value = next
         hasUnsavedChanges.value = true
         renderer?.setScene(model, embeddedBitmaps, next, sampling.value ?: SamplingMode.NEAREST)
+        // MISSÃO: catálogo (usado-por) e vista seguem a nova binding.
+        postTextureCatalog()
+        syncTextureSelectionWithMaterial(materialIndex)
     }
 
     fun selectMaterial(index: Int) {
@@ -1152,11 +1191,193 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         // Selecionar material mostra as UV da(s) malha(s) que o usam.
         val meshOf = model.renderables.firstOrNull { it.materialIndex == index }?.meshIndex
         selectedMesh.value = meshOf
+        // MISSÃO: a vista de textura segue o material (vê-se o que se liga).
+        syncTextureSelectionWithMaterial(index)
     }
 
     /** Seleção de malha (vista UV): filtra as linhas UV mostradas. */
     fun selectMesh(meshIndex: Int?) {
         selectedMesh.value = meshIndex
+    }
+
+    // ------------------------------------------------------------------
+    // MISSÃO UI/SELEÇÃO — catálogo, seleção de textura, cópia para projeto
+    // ------------------------------------------------------------------
+
+    /**
+     * Reconstrói o catálogo de texturas (modelo/bindings/nome mudaram) e
+     * valida a seleção atual (seleção órfã volta à textura do projeto).
+     */
+    private fun postTextureCatalog() {
+        val sizes = embeddedBitmaps.mapValues { (_, bmp) -> bmp.width to bmp.height }
+        val entries = TextureCatalog.build(
+            documentName = projectName.value ?: "textura",
+            documentWidth = compositeDoc.width,
+            documentHeight = compositeDoc.height,
+            materials = model.materials.map {
+                TextureCatalog.MaterialInfo(it.name, it.textureImageIndex)
+            },
+            bindings = bindings.value ?: emptyMap(),
+            embeddedSizes = sizes
+        )
+        textureCatalog.postValue(entries)
+        val sel = selectedTexture.value ?: TextureCatalog.DOCUMENT_ID
+        if (entries.none { it.id == sel }) {
+            selectedTexture.postValue(TextureCatalog.DOCUMENT_ID)
+            postViewTexture()
+        }
+    }
+
+    /** Alinha o bitmap das vistas UV/Dividido com a textura SELECIONADA. */
+    private fun postViewTexture() {
+        val id = selectedTexture.value ?: TextureCatalog.DOCUMENT_ID
+        val bmp = TextureCatalog.parseEmbeddedImageIndex(id)?.let { embeddedBitmaps[it] }
+            ?: presentationBitmap.value
+        viewTexture.postValue(bmp)
+    }
+
+    /**
+     * A vista segue o material selecionado: material com EMBEDDED mostra a
+     * embutida; caso contrário, a textura do projeto. (MISSÃO: a seleção de
+     * textura é DISTINTA, mas coerente com a de material.)
+     */
+    private fun syncTextureSelectionWithMaterial(materialIndex: Int) {
+        val ref = bindings.value?.get(materialIndex)
+        val imageIndex = model.materials.getOrNull(materialIndex)?.textureImageIndex
+        val next = if (ref == TextureRef.EMBEDDED && imageIndex != null) {
+            TextureCatalog.embeddedId(imageIndex)
+        } else {
+            TextureCatalog.DOCUMENT_ID
+        }
+        if (selectedTexture.value != next) {
+            selectedTexture.value = next
+            postViewTexture()
+        }
+    }
+
+    /**
+     * Seleciona UMA textura do catálogo (requisito da missão: seleção de
+     * textura DISTINTA de material/objeto/face):
+     *  - "document": pintura edita a textura do projeto (comportamento atual);
+     *  - "embedded:<i>": vista só de leitura na UV/Dividido, material que a
+     *    usa fica selecionado; a pintura fica BLOQUEADA COM EXPLICAÇÃO (a
+     *    pintura altera APENAS o recurso selecionado — nunca substitui em
+     *    silêncio outro material/recurso).
+     */
+    fun selectTexture(id: String) {
+        val entries = textureCatalog.value ?: emptyList()
+        val entry = entries.firstOrNull { it.id == id }
+        if (entry == null) {
+            statusMessage.value = "Textura desconhecida: $id"
+            return
+        }
+        selectedTexture.value = entry.id
+        if (entry.kind == TextureEntry.Kind.EMBEDDED) {
+            entry.usedByMaterials.firstOrNull()?.let { selectedMaterial.value = it }
+            statusMessage.value = "Textura embutida \"${entry.name}\" " +
+                "(${entry.width}x${entry.height}) — só leitura. " +
+                "Usa \"Copiar para o projeto\" para a editar."
+        } else {
+            statusMessage.value = "A pintar em: ${entry.name} (${entry.width}x${entry.height})"
+        }
+        postViewTexture()
+    }
+
+    /**
+     * GUARDA da pintura (missão: "a pintura deve alterar apenas o recurso
+     * selecionado, sem substituir silenciosamente outros materiais"): pintar
+     * edita a textura do PROJETO. Com uma embutida selecionada (só leitura),
+     * a pintura é recusada COM EXPLICAÇÃO — nunca substitui em silêncio.
+     */
+    private fun paintBlockedByTextureSelection(): Boolean {
+        if (selectedTexture.value == TextureCatalog.DOCUMENT_ID) return false
+        statusMessage.value =
+            "A pintura edita a textura do projeto. Seleciona \"Textura do projeto\" " +
+                "nas Texturas do modelo (ou copia a embutida para o projeto) para pintar."
+        return true
+    }
+
+    /**
+     * COPIA a textura embutida [imageIndex] para o projeto — a ÚNICA forma de
+     * a editar (limitação documentada: embutidas são só de leitura).
+     *  - MESMAS dimensões: funde na camada ATIVA (UMA entrada de histórico);
+     *  - dimensões DIFERENTES: substitui a pilha por UMA camada (anunciado —
+     *    mesma regra do adoptFromStudio2D, nunca silencioso).
+     * O material selecionado passa a APRESENTAR a textura do projeto (binding
+     * explícita e anunciada) para a edição ficar visível no modelo.
+     */
+    fun copyEmbeddedToDocument(imageIndex: Int) {
+        val bmp = embeddedBitmaps[imageIndex] ?: return
+        val w = bmp.width
+        val h = bmp.height
+        val pixels = IntArray(w * h)
+        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+        val materialIndex = selectedMaterial.value ?: 0
+        mutationExecutor.execute {
+            var replaced = false
+            if (PixelAdoption.sameDimensions(w, h, compositeDoc.width, compositeDoc.height)) {
+                val layer = layerStack.active()
+                val result = PixelAdoption.mergeIntoLayer(layer.doc, pixels, w, h)
+                if (result != null) {
+                    layerHistory.commitDeltas(
+                        layerStack.activeIndex, result.indices, result.before, result.after,
+                        result.count, result.minX, result.minY, result.maxX, result.maxY
+                    )
+                    applyEdit(result.minX, result.minY, result.maxX, result.maxY)
+                }
+                statusMessage.postValue(
+                    "Textura embutida copiada para a camada ativa (${w}x${h})"
+                )
+            } else {
+                val stack = LayerStack(w, h)
+                stack.seedSingleLayer(pixels.copyOf())
+                layerStack = stack
+                layerHistory.clear()
+                strokeScratch = NativeEngine.Scratch(w * h)
+                compositeDoc = PixelDocument(w, h, pixels.copyOf())
+                presentationBitmap.postValue(
+                    Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                        setPixels(pixels.copyOf(), 0, w, 0, 0, w, h)
+                    }
+                )
+                renderer?.replaceDocumentTexture(compositeDoc.copyPixels(), w, h)
+                renderer?.setScene(
+                    model, embeddedBitmaps, bindings.value ?: emptyMap(),
+                    sampling.value ?: SamplingMode.NEAREST
+                )
+                replaced = true
+                statusMessage.postValue(
+                    "Textura embutida substituiu a textura do projeto (${w}x${h}) — 1 camada"
+                )
+            }
+            hasUnsavedChangesLive = true
+            postUnsaved()
+            postLayersState()
+            postPaintState()
+            invalidateMask()
+            postTextureCatalog()
+            viewModelScope.launch(Dispatchers.Main) {
+                // Binding EXPLÍCITA do material selecionado → textura do
+                // projeto (a edição passa a ver-se no modelo; os chips mostram
+                // a mudança — nunca silenciosa).
+                bindings.value = (bindings.value ?: emptyMap()).toMutableMap().apply {
+                    put(materialIndex, TextureRef.DOCUMENT)
+                }
+                hasUnsavedChanges.value = true
+                selectedTexture.value = TextureCatalog.DOCUMENT_ID
+                postTextureCatalog()
+                postViewTexture()
+                renderer?.setScene(
+                    model, embeddedBitmaps, bindings.value ?: emptyMap(),
+                    sampling.value ?: SamplingMode.NEAREST
+                )
+                val materialName = model.materials.getOrNull(materialIndex)?.name
+                    ?: materialIndex.toString()
+                statusMessage.value =
+                    "Material \"$materialName\" passa a apresentar a textura do projeto " +
+                        "(edição visível no modelo)"
+            }
+        }
     }
 
     /** Amostragem Nearest (padrão) ou Linear (opcional) — requisito Fase 3. */
@@ -1217,6 +1438,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         invalidateMask()
         renderer?.replaceDocumentTexture(compositeDoc.copyPixels(), width, height)
         renderer?.setScene(model, embeddedBitmaps, bindings.value ?: emptyMap(), sampling.value ?: SamplingMode.NEAREST)
+        postTextureCatalog()
+        postViewTexture()
     }
 
     private var project: PixelProject? = null
@@ -1341,6 +1564,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         invalidateMask()
         renderer?.replaceDocumentTexture(compositeDoc.copyPixels(), doc.width, doc.height)
         renderer?.setScene(model, embeddedBitmaps, bindings.value ?: emptyMap(), sampling.value ?: SamplingMode.NEAREST)
+        postTextureCatalog()
+        postViewTexture()
         // Modo guardado só se o modelo atual permitir.
         appliedMode?.let { if (model.hasUv) mode.value = it }
     }
@@ -1392,33 +1617,18 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         val handoff = StudioSharedBus.consumeFrom2D() ?: return false
         if (handoff.width <= 0 || handoff.height <= 0) return false
         if (handoff.width == compositeDoc.width && handoff.height == compositeDoc.height) {
-            val idx = IntArray(handoff.pixels.size)
-            val before = IntArray(handoff.pixels.size)
-            val after = IntArray(handoff.pixels.size)
-            var n = 0
-            var minX = Int.MAX_VALUE; var maxX = Int.MIN_VALUE
-            var minY = Int.MAX_VALUE; var maxY = Int.MIN_VALUE
+            // MISSÃO: fusão extraída para [PixelAdoption] (pura, partilhada com
+            // copyEmbeddedToDocument e testável em JVM) — comportamento igual.
             val layer = layerStack.active()
-            for (y in 0 until handoff.height) {
-                for (x in 0 until handoff.width) {
-                    val i = y * handoff.width + x
-                    val newColor = handoff.pixels[i]
-                    val old = layer.doc.getAt(i)
-                    if (old == newColor) continue
-                    idx[n] = i; before[n] = old; after[n] = newColor
-                    layer.doc.setAt(i, newColor)
-                    n++
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
-                }
-            }
-            if (n > 0) {
+            val result = PixelAdoption.mergeIntoLayer(
+                layer.doc, handoff.pixels, handoff.width, handoff.height
+            )
+            if (result != null) {
                 layerHistory.commitDeltas(
-                    layerStack.activeIndex, idx, before, after, n, minX, minY, maxX, maxY
+                    layerStack.activeIndex, result.indices, result.before, result.after,
+                    result.count, result.minX, result.minY, result.maxX, result.maxY
                 )
-                applyEdit(minX, minY, maxX, maxY)
+                applyEdit(result.minX, result.minY, result.maxX, result.maxY)
             }
             statusMessage.value = "Textura do Texture Studio aplicada à camada ativa " +
                 "(${handoff.width}x${handoff.height})"
@@ -1444,6 +1654,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         postLayersState()
         postPaintState()
         invalidateMask()
+        postTextureCatalog()
+        postViewTexture()
         return true
     }
 

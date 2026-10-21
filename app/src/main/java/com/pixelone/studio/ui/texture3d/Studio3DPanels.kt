@@ -45,6 +45,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.pixelone.studio.editor.PixelIcons
 import com.pixelone.studio.studio3d.GltfLimits
+import com.pixelone.studio.studio3d.TextureCatalog
+import com.pixelone.studio.studio3d.TextureEntry
 import com.pixelone.studio.studio3d.Studio3DState.SamplingMode
 import com.pixelone.studio.studio3d.Studio3DState.StudioMode
 import com.pixelone.studio.studio3d.Studio3DState.TextureRef
@@ -74,7 +76,8 @@ internal fun UvMode(
     Box(Modifier.fillMaxWidth().fillMaxHeight()) {
         val showUv by viewModel.showUvOverlay.observeAsLocalState()
         val selectedMesh by viewModel.selectedMesh.observeAsLocalState()
-        val bmp by viewModel.presentationBitmap.observeAsLocalState()
+        // MISSÃO: a vista mostra a textura SELECIONADA (projeto ou embutida).
+        val bmp by viewModel.viewTexture.observeAsLocalState()
         val islands by viewModel.selectedIsland.observeAsLocalState()
         val paintVersion by viewModel.paintVersion.observeAsLocalState()
 
@@ -132,9 +135,11 @@ internal fun SplitMode(viewModel: Studio3DViewModel) {
         // 3D em cima (metade da área principal) — toque seleciona a face/ilha.
         Studio3DGlViewport(viewModel, Modifier.fillMaxWidth().weight(1f))
         // Superfície de pintura em baixo — mostra a mesma seleção (ilhas).
-        val bmp by viewModel.presentationBitmap.observeAsLocalState()
+        // MISSÃO: mostra a textura SELECIONADA (projeto ou embutida).
+        val bmp by viewModel.viewTexture.observeAsLocalState()
         val paintVersion by viewModel.paintVersion.observeAsLocalState()
         val showUv by viewModel.showUvOverlay.observeAsLocalState()
+        val selectedMesh by viewModel.selectedMesh.observeAsLocalState()
         val islands by viewModel.selectedIsland.observeAsLocalState()
         var paintView by remember { mutableStateOf<TexturePaintView?>(null) }
         AndroidView(
@@ -151,7 +156,8 @@ internal fun SplitMode(viewModel: Studio3DViewModel) {
             update = { view ->
                 view.textureBitmap = bmp
                 // RONDA A (F): o modo Dividido RESPEITA o interruptor "Linhas UV".
-                view.uvSegments = if (showUv) viewModel.uvWireframeSegments() else null
+                // MISSÃO (FASE 4): filtro de malha coerente com o modo UV.
+                view.uvSegments = if (showUv) viewModel.uvWireframeSegments(selectedMesh) else null
                 view.islandHighlightSegments = viewModel.islandHighlightSegments()
                 view.invalidate()
             }
@@ -249,6 +255,10 @@ private fun Panel3DTexture(viewModel: Studio3DViewModel, onPaintTexture: () -> U
     val selectedMaterial by viewModel.selectedMaterial.observeAsLocalState()
     val bindings by viewModel.bindings.observeAsLocalState()
     val material = viewModel.model.materials.getOrNull(selectedMaterial)
+    // MISSÃO: catálogo de TEXTURAS com identidade estável — seleção distinta
+    // de material/objeto/face (o mesmo painel mostra os dois níveis).
+    val catalog by viewModel.textureCatalog.observeAsLocalState()
+    val selectedTexture by viewModel.selectedTexture.observeAsLocalState()
     Column {
         Text(
             "Material: ${material?.name ?: "—"}",
@@ -262,6 +272,35 @@ private fun Panel3DTexture(viewModel: Studio3DViewModel, onPaintTexture: () -> U
             BindingChip("Textura do projeto", TextureRef.DOCUMENT, bindings, selectedMaterial, viewModel)
             BindingChip("Embutida", TextureRef.EMBEDDED, bindings, selectedMaterial, viewModel)
             BindingChip("Sem textura", TextureRef.NONE, bindings, selectedMaterial, viewModel)
+        }
+        Spacer(Modifier.height(10.dp))
+        // MISSÃO: TEXTURAS do modelo — identidade estável, propriedades
+        // próprias (nome, dimensões, materiais que a usam).
+        Text(
+            "Texturas do modelo",
+            style = MaterialTheme.typography.labelSmall,
+            color = PixelGray
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            catalog.forEach { entry ->
+                TextureChip(
+                    entry = entry,
+                    selected = entry.id == selectedTexture,
+                    onClick = { viewModel.selectTexture(entry.id) }
+                )
+            }
+        }
+        // Embutida selecionada: única forma de a editar é copiar (limitação
+        // documentada) — a cópia anuncia-se e rebind o material explicitamente.
+        if (selectedTexture != TextureCatalog.DOCUMENT_ID) {
+            Spacer(Modifier.height(4.dp))
+            TextButton(onClick = {
+                TextureCatalog.parseEmbeddedImageIndex(selectedTexture)
+                    ?.let { viewModel.copyEmbeddedToDocument(it) }
+            }) {
+                Text("Copiar para o projeto (para editar)", color = PixelOrange)
+            }
         }
         Spacer(Modifier.height(10.dp))
         TextButton(onClick = onPaintTexture) {
@@ -294,6 +333,60 @@ private fun BindingChip(
             .border(1.dp, if (selected) PixelOrange else PixelGrayBorder, MaterialTheme.shapes.small)
             .clickable { viewModel.bindMaterial(materialIndex, ref) }
             .padding(horizontal = 10.dp, vertical = 6.dp)
+    )
+}
+
+/**
+ * MISSÃO: chip de UMA textura do catálogo — identidade estável + propriedades
+ * próprias (nome, dimensões, quantos materiais a apresentam).
+ */
+@Composable
+private fun TextureChip(
+    entry: TextureEntry,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .background(if (selected) PixelSurfaceElevated else PixelSurface)
+            .border(1.dp, if (selected) PixelOrange else PixelGrayBorder, MaterialTheme.shapes.small)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+    ) {
+        Text(
+            "${entry.name} · ${entry.width}x${entry.height}",
+            style = MaterialTheme.typography.labelSmall,
+            color = if (selected) PixelOrange else PixelGrayLight
+        )
+        Text(
+            if (entry.isDocument) {
+                "projeto · ${entry.usedByMaterials.size} material(is)"
+            } else {
+                "embutida · ${entry.usedByMaterials.size} material(is)"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = PixelGray
+        )
+    }
+}
+
+/**
+ * MISSÃO: linha compacta que diz QUE textura está na vista/alvo da pintura —
+ * a troca de recurso nunca é silenciosa.
+ */
+@Composable
+internal fun PaintTargetLine(viewModel: Studio3DViewModel) {
+    val selectedTexture by viewModel.selectedTexture.observeAsLocalState()
+    val catalog by viewModel.textureCatalog.observeAsLocalState()
+    val entry = catalog.firstOrNull { it.id == selectedTexture } ?: return
+    Text(
+        if (entry.isDocument) {
+            "A pintar em: ${entry.name} (${entry.width}x${entry.height})"
+        } else {
+            "A ver: ${entry.name} — embutida ${entry.width}x${entry.height} (pintura bloqueada)"
+        },
+        style = MaterialTheme.typography.labelSmall,
+        color = if (entry.isDocument) PixelGray else PixelOrange
     )
 }
 
@@ -436,6 +529,8 @@ private fun PanelUv(
             }
         }
         Spacer(Modifier.height(4.dp))
+        // MISSÃO: que textura está na vista/alvo da pintura.
+        PaintTargetLine(viewModel)
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Interruptor ÚNICO de linhas UV (requisito G) — no painel inferior.
             Text("Linhas UV", style = MaterialTheme.typography.labelMedium, color = PixelGrayLight)
@@ -514,6 +609,9 @@ private fun PanelSplit(viewModel: Studio3DViewModel) {
             style = MaterialTheme.typography.labelSmall,
             color = PixelGray
         )
+        Spacer(Modifier.height(4.dp))
+        // MISSÃO: que textura está na vista/alvo da pintura.
+        PaintTargetLine(viewModel)
         Spacer(Modifier.height(4.dp))
         // Pincéis, bloqueio na ilha, simetria e margem (Ronda B).
         PaintOptionsRow(viewModel, paintState, selection != null)

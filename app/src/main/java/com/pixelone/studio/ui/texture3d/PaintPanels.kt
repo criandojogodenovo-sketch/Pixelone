@@ -64,68 +64,80 @@ internal fun PaintToolBar(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 4.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(2.dp)
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            // Pintar / Navegar (requisito: alterna e é sempre visível).
-            Box(
+            // CORREÇÃO DA MISSÃO (área segura / diferentes dimensões de ecrã):
+            // a barra tem ~530dp de conteúdo fixo — num ecrã de 360dp os
+            // DESFAZER/REFAZER ficavam FORA do ecrã (Row sem rolagem). O
+            // segmento de ferramentas agora RODA; Desfazer/Refazer ficam FIXOS
+            // à direita, sempre visíveis e acessíveis (requisito Ronda B).
+            Row(
                 modifier = Modifier
-                    .height(48.dp)
-                    .background(if (state.paintMode) PixelOrange else PixelSurfaceElevated)
-                    .border(
-                        1.dp,
-                        if (state.paintMode) PixelOrange else PixelGrayBorder,
-                        MaterialTheme.shapes.small
-                    )
-                    .clickable { viewModel.setPaintMode(!state.paintMode) }
-                    .padding(horizontal = 10.dp),
-                contentAlignment = Alignment.Center
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        if (state.paintMode) PixelIcons.pan() else PixelIcons.pencil(),
-                        contentDescription = null,
-                        tint = if (state.paintMode) Color.Black else PixelGrayLight,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        if (state.paintMode) "Pintar" else "Navegar",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = if (state.paintMode) Color.Black else PixelGrayLight
-                    )
+                // Pintar / Navegar (requisito: alterna e é sempre visível).
+                Box(
+                    modifier = Modifier
+                        .height(48.dp)
+                        .background(if (state.paintMode) PixelOrange else PixelSurfaceElevated)
+                        .border(
+                            1.dp,
+                            if (state.paintMode) PixelOrange else PixelGrayBorder,
+                            MaterialTheme.shapes.small
+                        )
+                        .clickable { viewModel.setPaintMode(!state.paintMode) }
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            if (state.paintMode) PixelIcons.pan() else PixelIcons.pencil(),
+                            contentDescription = null,
+                            tint = if (state.paintMode) Color.Black else PixelGrayLight,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            if (state.paintMode) "Pintar" else "Navegar",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (state.paintMode) Color.Black else PixelGrayLight
+                        )
+                    }
                 }
+                // Ferramentas (48 dp).
+                ToolButton(PixelIcons.pencil(), "Lápis", state.tool == Tool.PENCIL) {
+                    viewModel.setTool(Tool.PENCIL)
+                }
+                ToolButton(PixelIcons.eraser(), "Borracha", state.tool == Tool.ERASER) {
+                    viewModel.setTool(Tool.ERASER)
+                }
+                ToolButton(PixelIcons.fill(), "Balde", state.tool == Tool.FILL) {
+                    viewModel.setTool(Tool.FILL)
+                }
+                ToolButton(PixelIcons.eyedropper(), "Conta-gotas", state.tool == Tool.EYEDROPPER) {
+                    viewModel.setTool(Tool.EYEDROPPER)
+                }
+                ToolButton(PixelIcons.line(), "Linha", state.tool == Tool.LINE) {
+                    viewModel.setTool(Tool.LINE)
+                }
+                ToolButton(PixelIcons.rect(), "Retângulo", state.tool == Tool.RECT) {
+                    viewModel.setTool(Tool.RECT)
+                }
+                Spacer(Modifier.width(2.dp))
+                // Cor ativa (48 dp) — abre o seletor (hex + paleta).
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .background(Color(state.color))
+                        .border(2.dp, PixelOrange, MaterialTheme.shapes.small)
+                        .clickable { showColorPicker = true }
+                )
             }
-            // Ferramentas (48 dp).
-            ToolButton(PixelIcons.pencil(), "Lápis", state.tool == Tool.PENCIL) {
-                viewModel.setTool(Tool.PENCIL)
-            }
-            ToolButton(PixelIcons.eraser(), "Borracha", state.tool == Tool.ERASER) {
-                viewModel.setTool(Tool.ERASER)
-            }
-            ToolButton(PixelIcons.fill(), "Balde", state.tool == Tool.FILL) {
-                viewModel.setTool(Tool.FILL)
-            }
-            ToolButton(PixelIcons.eyedropper(), "Conta-gotas", state.tool == Tool.EYEDROPPER) {
-                viewModel.setTool(Tool.EYEDROPPER)
-            }
-            ToolButton(PixelIcons.line(), "Linha", state.tool == Tool.LINE) {
-                viewModel.setTool(Tool.LINE)
-            }
-            ToolButton(PixelIcons.rect(), "Retângulo", state.tool == Tool.RECT) {
-                viewModel.setTool(Tool.RECT)
-            }
-            Spacer(Modifier.width(2.dp))
-            // Cor ativa (48 dp) — abre o seletor (hex + paleta).
-            Box(
-                modifier = Modifier
-                    .size(48.dp)
-                    .background(Color(state.color))
-                    .border(2.dp, PixelOrange, MaterialTheme.shapes.small)
-                    .clickable { showColorPicker = true }
-            )
-            Spacer(Modifier.weight(1f))
-            // Desfazer/Refazer — SEMPRE visíveis (partilhados entre 3D e UV).
+            // Desfazer/Refazer — SEMPRE visíveis (partilhados entre 3D e UV),
+            // FIXOS fora do segmento rolável.
             ToolButton(PixelIcons.undo(), "Desfazer", false, enabled = state.canUndo) {
                 viewModel.undo()
             }
