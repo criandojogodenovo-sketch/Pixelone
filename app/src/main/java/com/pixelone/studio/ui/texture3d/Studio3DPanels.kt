@@ -30,6 +30,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -67,6 +68,7 @@ internal fun UvMode(viewModel: Studio3DViewModel) {
         val bmp by viewModel.presentationBitmap.observeAsLocalState()
         var paintView by remember { mutableStateOf<TexturePaintView?>(null) }
         val islands by viewModel.selectedIsland.observeAsLocalState()
+        val paintVersion by viewModel.paintVersion.observeAsLocalState()
 
         AndroidView(
             factory = { ctx ->
@@ -83,6 +85,11 @@ internal fun UvMode(viewModel: Studio3DViewModel) {
                 view.invalidate()
             }
         )
+
+        // Redesenho ao vivo durante a pintura/undo (região suja já aplicada).
+        LaunchedEffect(paintVersion) {
+            paintView?.invalidate()
+        }
 
         // Interruptor UV (requisito) — overlay discreto no topo.
         Surface(
@@ -141,6 +148,8 @@ internal fun SplitMode(viewModel: Studio3DViewModel) {
         Studio3DGlViewport(viewModel, Modifier.fillMaxWidth().weight(1f))
         // Superfície de pintura em baixo.
         val bmp by viewModel.presentationBitmap.observeAsLocalState()
+        val paintVersion by viewModel.paintVersion.observeAsLocalState()
+        var paintView by remember { mutableStateOf<TexturePaintView?>(null) }
         AndroidView(
             modifier = Modifier.fillMaxWidth().weight(1f),
             factory = { ctx ->
@@ -149,6 +158,7 @@ internal fun SplitMode(viewModel: Studio3DViewModel) {
                     onPaintBegin = { x, y -> viewModel.paintBegin(x, y) }
                     onPaintMove = { x, y -> viewModel.paintMove(x, y) }
                     onPaintEnd = { viewModel.paintEnd() }
+                    paintView = this
                 }
             },
             update = { view ->
@@ -157,6 +167,10 @@ internal fun SplitMode(viewModel: Studio3DViewModel) {
                 view.invalidate()
             }
         )
+        // Redesenho ao vivo durante a pintura (o 3D já recebeu a região suja).
+        LaunchedEffect(paintVersion) {
+            paintView?.invalidate()
+        }
     }
 }
 

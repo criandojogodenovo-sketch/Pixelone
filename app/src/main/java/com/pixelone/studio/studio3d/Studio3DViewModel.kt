@@ -67,6 +67,12 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     /** Bitmap de apresentação para a superfície de pintura (2D). */
     val presentationBitmap = MutableLiveData<Bitmap?>(null)
 
+    /**
+     * Incrementado a cada região suja aplicada — a superfície de pintura
+     * observa e redesenha (invalidate) SEM recompor a árvore inteira.
+     */
+    val paintVersion = MutableLiveData(0)
+
     val hasUnsavedChanges = MutableLiveData(false)
     val statusMessage = MutableLiveData<String?>(null)
 
@@ -305,6 +311,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         }
         // GPU: APENAS a região suja (requisito do modo Dividido).
         renderer?.updateTextureRegion(rect, { doc.getAt(it) }, doc.width)
+        // Redesenho da superfície 2D (bitmap já foi atualizado regionalmente).
+        viewModelScope.launch(Dispatchers.Main) {
+            paintVersion.value = (paintVersion.value ?: 0) + 1
+        }
         if (hasUnsavedChangesLive) postUnsaved()
     }
 
