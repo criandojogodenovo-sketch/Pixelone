@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -630,7 +631,10 @@ internal fun Studio3DBottomNav(
     onOpen2Dto3D: () -> Unit
 ) {
     Surface(color = PixelSurfaceElevated, tonalElevation = 6.dp) {
-        Row(Modifier.fillMaxWidth().height(56.dp)) {
+        // RONDA A (A): navigationBarsPadding — os itens ficam ACIMA da barra
+        // de gestos/botões do sistema (edge-to-edge preservado; o comentário
+        // do chamador já o anunciava, mas o padding não estava aplicado).
+        Row(Modifier.fillMaxWidth().navigationBarsPadding().height(56.dp)) {
             NavItem("Texture", false, Modifier.weight(1f), onOpenTextureStudio)
             NavItem("3D", true, Modifier.weight(1f), null)
             NavItem("2D→3D", false, Modifier.weight(1f), onOpen2Dto3D)

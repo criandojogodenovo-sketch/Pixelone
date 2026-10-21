@@ -1,7 +1,9 @@
 # Relatório — Fase 3 · Ronda A (correções A–J + seleção de face/ilha)
 
-Branch: `fix/fase3-ronda-a-selecao-uv` · Commit: `ec3f3a9` · Data: 2026-10-21
+Branch: `fix/fase3-ronda-a-selecao-uv` · Commits: `ec3f3a9` + `9316272` (relatório) + ronda de REVERIFICAÇÃO independente · Data: 2026-10-21
 Âmbito: corrige a Fase 3 (3D Texture Studio). NÃO adiciona pintura no 3D, camadas nem ferramentas novas. Fases 1–2 intocadas (zero diffs fora do `studio3d`/`ui.texture3d`).
+
+> **REVERIFICAÇÃO INDEPENDENTE (mesma sessão, auditoria do zero):** todo o trabalho abaixo foi re-auditado código a código (geometria verificada por produto vetorial, base da câmara do picking confrontada com `Mat4.lookAt`, formatos de realce confrontados com o consumidor) e RE-EXECUTADO do zero numa máquina limpa (SDK 35 + NDK 27.0.12077973 + JDK 17): 225 testes unitários ✓, `assembleDebugAndroidTest` ✓, `assembleRelease` ✓. A reverificação detetou **uma lacuna real no requisito A** (padding de navegação anunciado mas não aplicado na barra inferior) — corrigida neste commit.
 
 ---
 
@@ -9,8 +11,9 @@ Branch: `fix/fase3-ronda-a-selecao-uv` · Commit: `ec3f3a9` · Data: 2026-10-21
 
 ### A. Barra de estado sobre a hora/ícones do sistema
 - **Causa:** `MainActivity` usa `enableEdgeToEdge` (barras transparentes) e o `Texture3DStudioScreen` constrói a barra superior com um `Column` puro **sem insets**. As Fases 1–2 usam `Scaffold`/`TopAppBar`, que já respeitam insets — o problema era exclusivo do estúdio 3D.
-- **Correção:** `statusBarsPadding()` dentro da barra superior e `navigationBarsPadding()` na barra de navegação inferior (`Texture3DStudioScreen.kt`). A cor das barras estende-se por baixo das system bars (edge-to-edge preservado); o conteúdo começa abaixo da hora/ícones.
-- **Verificação:** compilação + revisão de código. Não validado em dispositivo físico (sem dispositivo no ambiente) — o padrão `statusBarsPadding` é o mecanismo oficial para este caso.
+- **Correção:** `statusBarsPadding()` dentro da barra superior e `navigationBarsPadding()` na barra de navegação inferior (`Studio3DBottomNav`, em `Studio3DPanels.kt`). A cor das barras estende-se por baixo das system bars (edge-to-edge preservado); o conteúdo começa abaixo da hora/ícones e a navegação inferior fica ACIMA da barra de gestos.
+- **REVERIFICAÇÃO:** a versão anterior deste commit anunciava o `navigationBarsPadding` num comentário mas NÃO o aplicava — a barra inferior ficava parcialmente sob a barra de gestos. Corrigido: o padding está agora na `Row` de `Studio3DBottomNav` (único ecrã que usa a função; Fases 1–2 intocadas).
+- **Verificação:** compilação + revisão de código. Não validado em dispositivo físico (sem dispositivo no ambiente) — o padrão `statusBarsPadding`/`navigationBarsPadding` é o mecanismo oficial para este caso.
 
 ### B. Cubo de demonstração incompleto (peças soltas, sem fundo)
 - **Causa (2 bugs reais, ambos reproduzidos por cálculo/teste):**
@@ -91,33 +94,35 @@ Branch: `fix/fase3-ronda-a-selecao-uv` · Commit: `ec3f3a9` · Data: 2026-10-21
 | `app/src/main/java/com/pixelone/studio/studio3d/Studio3DViewModel.kt` | `selectFaceAtNdc`, `IslandSelection(faceTriangle)`, `selectedIslandUvBounds`, realce por ilha, triplos no realce UV |
 | `app/src/main/java/com/pixelone/studio/studio3d/gl/ModelRenderer.kt` | Reposição de ids GL stale em `onSurfaceCreated` + reconstrução do IBO de realce |
 | `app/src/main/java/com/pixelone/studio/ui/texture3d/TexturePaintView.kt` | Linhas 1 px/AA off, paths por triplo, grelha de píxeis, `focusOnIsland`, tap-vs-arrasto |
-| `app/src/main/java/com/pixelone/studio/ui/texture3d/Studio3DPanels.kt` | Overlays removidos, Focar/Limpar, Dividido 50/50 com seleção nos 2 painéis, fila fixa de undo/redo, textos |
+| `app/src/main/java/com/pixelone/studio/ui/texture3d/Studio3DPanels.kt` | Overlays removidos, Focar/Limpar, Dividido 50/50 com seleção nos 2 painéis, fila fixa de undo/redo, textos; **reverificação:** `navigationBarsPadding()` aplicado de facto em `Studio3DBottomNav` (A) |
 | `app/src/main/java/com/pixelone/studio/ui/texture3d/Texture3DStudioScreen.kt` | Insets (A), área principal `weight(1f)`, toque→raycast, host da vista UV |
 | `app/src/test/java/com/pixelone/studio/studio3d/DemoGeometryTest.kt` | +4 testes (fecho, winding, layout UV, contagem, correspondência; 12 no total) |
 | `app/src/test/java/com/pixelone/studio/studio3d/MeshPickingTest.kt` | **NOVO** — 8 testes de picking |
 
 ---
 
-## 4. Testes executados (resultados REAIS)
+## 4. Testes executados (resultados REAIS — re-executados na reverificação)
 
-- **Suite unitária completa (`testDebugUnitTest`): 225 testes, 0 falhas, 0 erros, 0 ignorados.**
+- **Suite unitária completa (`testDebugUnitTest`): 225 testes, 0 falhas, 0 erros, 0 ignorados** — CONFIRMADA duas vezes: na ronda original e na reverificação independente (máquina limpa, JDK 17 + SDK 35 + NDK 27.0.12077973), a partir do working tree corrigido.
   - `DemoGeometryTest` 12 ✓ (fecho do cubo, winding, 7 ilhas sem sobreposição, contagem=desenho, correspondência UV)
   - `MeshPickingTest` 8 ✓ (raio NDC, toque no centro/acima, 5 faces por raio reto, ilha do chão, correspondência 3D↔UV, Möller–Trumbore unidade, hit mais próximo)
-  - `UvIslandsTest` 8 ✓ (regressão) · `GltfParserTest` 22 ✓ · `OspCodecStudio3DTest` ✓ (projetos v1/v2 abrem) · restantes suítes 2D/export/persistência ✓
-- **Testes instrumentados (`connectedDebugAndroidTest`): NÃO executados** — não há emulador/dispositivo neste ambiente. Os fontes de `androidTest` COMPILAM (`assembleDebugAndroidTest` BUILD SUCCESSFUL). O CI do projeto (emulador API 30) é quem os pode executar.
-- Interruptor de linhas UV: verificado por revisão de código (SplitMode respeita `showUvOverlay`) — não automatizável em JVM (Canvas/View não têm fallback JVM).
+  - `UvIslandsTest` 8 ✓ (regressão) · `GltfParserTest` 22 ✓ · `OspCodecStudio3DTest` 8 ✓ (projetos v1/v2 abrem) · restantes suítes 2D/export/persistência ✓ (24 suítes no total)
+- **Testes instrumentados (`connectedDebugAndroidTest`): NÃO executados** — não há emulador/dispositivo neste ambiente. Os fontes de `androidTest` COMPILAM (`assembleDebugAndroidTest` BUILD SUCCESSFUL — confirmado na reverificação). O CI do projeto (emulador API 30) é quem os pode executar.
+- Interruptor de linhas UV: verificado por revisão de código (SplitMode e UvMode respeitam `showUvOverlay`) — não automatizável em JVM (Canvas/View não têm fallback JVM).
 
 ## 5. Compilação Release e assinatura
 
-- `./gradlew :app:assembleRelease` → **BUILD SUCCESSFUL** (2 m 26 s; inclui build nativo C++17 com NDK 27.0.12077973 e `lintVitalRelease` sem erros).
-- Artefacto: `app/build/outputs/apk/release/app-release-unsigned.apk` (8 314 772 bytes; SHA-256 `7fe95511cf626cac667ff81a97209dc66787234a9197cba181e62cfc87f86047`; versionCode 6, versionName 0.4.0-fase-3d).
-- **Assinatura: o APK local NÃO está assinado** (`apksigner verify` → DOES NOT VERIFY). É o comportamento documentado do projeto: a assinatura usa exclusivamente os secrets do GitHub Actions (`ANDROID_KEYSTORE_BASE64`, etc.) e o workflow só corre em `develop`/manual. A configuração de assinatura em `build.gradle.kts` NÃO foi alterada (nem versionCode) — a assinatura da versão anterior mantém-se; nenhuma chave nova foi criada; nenhum segredo comitado.
+- `./gradlew :app:assembleRelease` → **BUILD SUCCESSFUL** — confirmado na reverificação (máquina limpa; inclui build nativo C++17 nas 4 ABIs com NDK 27.0.12077973 e `lintVitalRelease` sem erros).
+- Artefacto pós-reverificação: `app/build/outputs/apk/release/app-release-unsigned.apk` (8 314 772 bytes; SHA-256 `d3d641deb36b3f07f39e0a58c940320897cd7965523a3c3d43ccd799303a81cf`; versionCode 6, versionName 0.4.0-fase-3d). O SHA difere da ronda original (`7fe955…`) porque inclui a correção de insets da barra inferior — esperado.
+- **Assinatura: o APK local NÃO está assinado** (`apksigner verify` → DOES NOT VERIFY — confirmado na reverificação). É o comportamento documentado do projeto: a assinatura usa exclusivamente os secrets do GitHub Actions e o workflow só corre em `develop`/manual. A configuração de assinatura em `build.gradle.kts` NÃO foi alterada (nem versionCode) — a assinatura da versão anterior mantém-se; nenhuma chave nova foi criada; nenhum segredo comitado.
 - **Não há link de APK publicado** — esta ronda não publica nada por decisão honesta: só o CI com os secrets pode gerar o APK assinado.
 
 ## 6. Branch e commits
 
 - Branch: `fix/fase3-ronda-a-selecao-uv` (a partir de `develop` @ `18f6d1c`)
 - Commit: `ec3f3a9` — fix(studio3d)+feat(seleção): Ronda A — correções A–J e picking de face/ilha
+- Commit: `9316272` — docs: relatório da Ronda A
+- Commit da reverificação: correção do requisito A (insets na barra inferior) + este relatório atualizado
 
 ## 7. Limitações e problemas que ainda falham
 
@@ -125,5 +130,6 @@ Branch: `fix/fase3-ronda-a-selecao-uv` · Commit: `ec3f3a9` · Data: 2026-10-21
 2. **Testes instrumentados não executados** nesta ronda (sem emulador); o CI do projeto continua a ser a via oficial.
 3. O **picking com modelos importados** (GLB reais) não foi testado contra ficheiros reais — o algoritmo é genérico e a geometria demo cobre os casos testados.
 4. **Pintura na vista UV** (modo UV selecionar ilha e pintar-lhe por cima) continua a ser por pixel do documento — a ronda NÃO adiciona pintura limitada à ilha (fica para a ronda seguinte, como pedido).
-5. O Snackbar mantém o padding fixo de 200 dp herdado da Fase 3 (cosmético; não fazia parte de A–J).
-6. O 2D→3D Studio continua "FASE 0 - PLANEADO" (fora do âmbito).
+5. **Alvos de toque < 48 dp PRÉ-EXISTENTES da Fase 3** (fora do âmbito A–J, não tocados): os chips do seletor de modo (36 dp) e o chip "Repor câmara" (~36 dp de altura). Tudo o que a ronda criou/toque cumpre 48 dp (Focar 64×48, Limpar 76×48, undo/redo 48, pincéis 48, barra superior 48).
+6. O Snackbar mantém o padding fixo de 200 dp herdado da Fase 3 (cosmético; não fazia parte de A–J).
+7. O 2D→3D Studio continua "FASE 0 - PLANEADO" (fora do âmbito).
