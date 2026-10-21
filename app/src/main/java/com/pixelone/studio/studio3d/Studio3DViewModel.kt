@@ -8,13 +8,18 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
 import com.pixelone.studio.perf.PerfLog
 import com.pixelone.studio.pixel.HistoryManager
+import com.pixelone.studio.pixel.LayerStack
+import com.pixelone.studio.pixel.LayeredHistory
 import com.pixelone.studio.pixel.NativeEngine
 import com.pixelone.studio.pixel.PixelDocument
-import com.pixelone.studio.pixel.PixelEngine
 import com.pixelone.studio.project.PixelProject
 import com.pixelone.studio.osp.FileSystemProjectRepository
+import com.pixelone.studio.osp.LayersCodec
 import com.pixelone.studio.osp.MiniJson
 import com.pixelone.studio.studio3d.GltfParser.GltfModel
+import com.pixelone.studio.studio3d.PaintCore.MirrorBase
+import com.pixelone.studio.studio3d.PaintCore.Symmetry
+import com.pixelone.studio.studio3d.PaintCore.Tool
 import com.pixelone.studio.studio3d.Studio3DState.ModelKind
 import com.pixelone.studio.studio3d.Studio3DState.SamplingMode
 import com.pixelone.studio.studio3d.Studio3DState.StudioMode
@@ -29,42 +34,48 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * ViewModel do 3D Texture Studio (Fase 3).
+ * ViewModel do 3D Texture Studio (Fase 3, Ronda B — PINTURA).
  *
  * REGRAS DE ARQUITETURA (herdadas do projeto):
- *  - A textura do 3D Studio É um [PixelDocument] (buffer direto partilhado
- *    Kotlin↔C++) — a mesma base do editor 2D, com o MESMO motor de pintura
- *    ([PixelEngine]) e histórico esparso ([HistoryManager]). Nada duplicado.
+ *  - A textura do 3D Studio vive numa PILHA DE CAMADAS ([LayerStack]) — cada
+ *    camada é um [PixelDocument] (buffer direto partilhado Kotlin↔C++); a
+ *    COMPOSIÇÃO ([compositeDoc]) é o que a GPU, a vista UV e o Texture
+ *    Studio 2D veem. Projetos antigos abrem como UMA camada.
  *  - TODAS as mutações de píxeis correm num executor serial único
  *    ("pixelone-3d-mutation") — sem leituras rasgadas, igual ao editor 2D.
  *  - A GPU recebe APENAS a região suja ([ModelRenderer.updateTextureRegion])
- *    enquanto se pinta (modo Dividido) — nunca a textura inteira por traço.
- *  - Modelos glTF são analisados fora da main thread; a GPU é atualizada
- *    através de [ModelRenderer] (fila de comandos, thread GL).
+ *    enquanto se pinta — nunca a textura inteira por traço.
+ *  - Pintar NO 3D e NA UV usa o MESMO funil ([PaintCore]): raycast → UV
+ *    (baricêntricas) → texel → carimbo com máscara de ilha e simetria.
+ *  - O histórico ([LayeredHistory]) é GLOBAL (3D/UV/camadas partilham) com
+ *    deltas esparsos e orçamento de memória para aparelhos de 4 GB.
  *
- * PERSISTÊNCIA: o projeto continua a ser um .osp (pixels.rgba = a textura);
- * a secção studio3d.json guarda REFERÊNCIAS (modelo, bindings, câmara,
- * amostragem) com versionamento v2 — projetos antigos (v1) abrem sem 3D.
+ * PERSISTÊNCIA: .osp v3 — pixels.rgba = composição; layers.json + layer-N.rgba
+ * = camadas; studio3d.json = referências 3D. Projetos v1/v2 abrem como 1 camada.
  */
 class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     private val repository = FileSystemProjectRepository(File(app.filesDir, "projects"))
 
     // ------------------------------------------------------------------
-    // Textura (PixelDocument) e histórico
+    // Camadas + composição + histórico (Ronda B)
     // ------------------------------------------------------------------
 
-    var document: PixelDocument? = null
+    var layerStack: LayerStack = LayerStack(64, 64)
         private set
 
-    private var project: PixelProject? = null
-    private var history = HistoryManager()
+    /** Composição das camadas visíveis — fonte para GPU/UV/2D/exportação. */
+    var compositeDoc: PixelDocument = PixelDocument(64, 64)
+        private set
+
+    private val layerHistory = LayeredHistory()
     private var strokeScratch: NativeEngine.Scratch? = null
+
     private val mutationExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "pixelone-3d-mutation").apply { isDaemon = true }
     }
 
-    /** Bitmap de apresentação para a superfície de pintura (2D). */
+    /** Bitmap de apresentação (COMPOSIÇÃO) para a superfície de pintura (2D). */
     val presentationBitmap = MutableLiveData<Bitmap?>(null)
 
     /**
@@ -108,6 +119,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     val sampling = MutableLiveData(SamplingMode.NEAREST)
     val mode = MutableLiveData(StudioMode.THREE_D)
     val showUvOverlay = MutableLiveData(true)
+    val showWireframe = MutableLiveData(false)
     val selectedMaterial = MutableLiveData(0)
 
     /** Malha selecionada na vista UV (null = todas). */
@@ -116,12 +128,6 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Seleção partilhada pelos painéis 3D e UV (requisito Ronda A: no modo
      * Dividido aparece nos DOIS painéis em simultâneo).
-     *
-     * @param renderableIndex primitiva tocada.
-     * @param island ilha UV que contém a face tocada (destacada na vista UV).
-     * @param faceTriangle índice do TRIÂNGULO tocado pelo raycast (null quando
-     *        a seleção veio da vista UV — aí a unidade é a ilha inteira).
-     *        No demo, face == ilha (1 ilha por face).
      */
     data class IslandSelection(
         val renderableIndex: Int,
@@ -141,14 +147,72 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     private var renderer: ModelRenderer? = null
 
     // ------------------------------------------------------------------
-    // Ciclo de vida
+    // Estado de pintura (Ronda B)
     // ------------------------------------------------------------------
+
+    /** Estado observável da barra de pintura (snapshot — UI reage como um todo). */
+    data class PaintState(
+        val tool: Tool = Tool.PENCIL,
+        val brush: Int = 1,
+        val color: Int = DEFAULT_COLOR,
+        val paintMode: Boolean = false,       // false = Navegar (não pinta sem querer)
+        val lockToIsland: Boolean = true,     // Bloquear na ilha (default c/ seleção)
+        val symmetry: Symmetry = Symmetry.NONE,
+        val mirrorBase: MirrorBase = MirrorBase.TEXTURE,
+        val fillTolerance: Int = 0,
+        val islandPadding: Int = DEFAULT_PADDING,
+        val recentColors: List<Int> = DEFAULT_RECENTS,
+        val canUndo: Boolean = false,
+        val canRedo: Boolean = false
+    )
+
+    data class LayerRow(
+        val index: Int,
+        val id: Long,
+        val name: String,
+        val visible: Boolean,
+        val opacity: Int,
+        val active: Boolean
+    )
+
+    private var paintState = PaintState()
+    val paint = MutableLiveData(paintState)
+
+    private var layersState: List<LayerRow> = emptyList()
+    val layers = MutableLiveData<List<LayerRow>>(emptyList())
+
+    private var lastPaintX = -1
+    private var lastPaintY = -1
+
+    /** Traço de forma (linha/retângulo): texel inicial (fixado no down). */
+    private var shapeStartX = -1
+    private var shapeStartY = -1
+
+    /** Balde armado: o próximo toque preenche (mantido por compatibilidade). */
+    var pendingFill: Boolean
+        get() = paintState.tool == Tool.FILL
+        set(_) { setTool(Tool.FILL) }
+
+    /** Escrita hasUnsavedChanges segura do executor → main. */
+    @Volatile
+    private var hasUnsavedChangesLive: Boolean = false
+
+    // Máscara de ilha (cache — construída no executor na 1.ª utilização)
+    private var cachedMask: IslandMask? = null
+    private var maskKey: Long = -1 // (renderable, islandId, padding, w, h) empacotado
+
+    /** Último triângulo tocado (otimização do raycast por movimento). */
+    @Volatile
+    private var lastPickTriangle: Int = -1
+    @Volatile
+    private var lastPickRenderable: Int = -1
 
     init {
         // Textura demo imediata: estúdio abre com modelo E textura visíveis.
         newTextureInternal(DemoGeometry.createDefaultTexture(), 64, 64, "textura-demo")
         computeIslands()
         fitCameraToModel()
+        postPaintState()
     }
 
     override fun onCleared() {
@@ -161,9 +225,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     fun attachRenderer(r: ModelRenderer?) {
         renderer = r
         if (r != null) {
-            val doc = document ?: return
+            val doc = compositeDoc
             r.replaceDocumentTexture(doc.copyPixels(), doc.width, doc.height)
             r.setScene(model, embeddedBitmaps, bindings.value ?: emptyMap(), sampling.value ?: SamplingMode.NEAREST)
+            r.setWireframe(showWireframe.value ?: false)
             applyHighlightToRenderer()
         }
     }
@@ -175,154 +240,341 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
-    // Pintura (modo Dividido e vista UV) — MESMO motor do editor 2D
+    // Estado da barra de pintura (UI → ViewModel)
     // ------------------------------------------------------------------
 
-    /** Início do traço (down do dedo). Um gesto = UMA entrada de histórico. */
+    private fun postPaintState() {
+        val maskActive = selectedIsland.value != null
+        paintState = paintState.copy(
+            mirrorBase = if (maskActive) MirrorBase.ISLAND else MirrorBase.TEXTURE,
+            canUndo = layerHistory.canUndo(),
+            canRedo = layerHistory.canRedo()
+        )
+        paint.postValue(paintState)
+    }
+
+    fun setTool(tool: Tool) {
+        paintState = paintState.copy(tool = tool)
+        paint.value = paintState
+    }
+
+    fun setBrush(size: Int) {
+        paintState = paintState.copy(brush = size.coerceIn(1, PixelBrushMax))
+        paint.value = paintState
+    }
+
+    fun setPaintMode(enabled: Boolean) {
+        paintState = paintState.copy(paintMode = enabled)
+        paint.value = paintState
+    }
+
+    fun setLockToIsland(enabled: Boolean) {
+        paintState = paintState.copy(lockToIsland = enabled)
+        paint.value = paintState
+    }
+
+    fun setSymmetry(symmetry: Symmetry) {
+        paintState = paintState.copy(symmetry = symmetry)
+        paint.value = paintState
+    }
+
+    fun setIslandPadding(px: Int) {
+        val p = px.coerceIn(0, IslandMask.MAX_PADDING)
+        paintState = paintState.copy(islandPadding = p)
+        paint.value = paintState
+        invalidateMask()
+    }
+
+    fun setFillTolerance(tolerance: Int) {
+        paintState = paintState.copy(fillTolerance = tolerance.coerceIn(0, 255))
+        paint.value = paintState
+    }
+
+    /** Escolhe uma cor (paleta/conta-gotas/hex) — entra nas recentes. */
+    fun setColor(color: Int) {
+        val recents = (listOf(color) + paintState.recentColors.filter { it != color })
+            .take(MAX_RECENTS)
+        paintState = paintState.copy(color = color, recentColors = recents)
+        paint.value = paintState
+        hasUnsavedChangesLive = true
+        postUnsaved()
+    }
+
+    fun setShowWireframe(show: Boolean) {
+        showWireframe.value = show
+        renderer?.setWireframe(show)
+    }
+
+    // ------------------------------------------------------------------
+    // PINTURA — funil único (3D e UV)
+    //
+    // Fontes de toque:
+    //  - Vista UV 2D (modo Dividido/UV): paintBegin/Move/End em TEXELS.
+    //  - Viewport 3D: raycast → uvAtHit (baricêntricas) → paintBeginUv/MoveUv
+    //    (UV) — mesma conversão uvToTexel, MESMO resultado (regra da Ronda B).
+    // ------------------------------------------------------------------
+
+    /** Início do traço na vista 2D/UV (texel). Um gesto = UMA entrada. */
     fun paintBegin(x: Int, y: Int) {
-        val doc = document ?: return
-        if (pendingFill) {
-            // Balde armado: este toque preenche (operação discreta).
-            pendingFill = false
-            fillAt(x, y)
+        val doc = compositeDoc
+        if (!doc.inBounds(x, y)) return
+        lastPaintX = x; lastPaintY = y
+        val tool = paintState.tool
+        if (tool == Tool.FILL) { fillAt(x, y); return }
+        if (tool == Tool.EYEDROPPER) { pickColorTexel(x, y); return }
+        // Formas: só fixa o ponto inicial (aplicadas no fim do gesto).
+        if (tool == Tool.LINE || tool == Tool.RECT) {
+            shapeStartX = x; shapeStartY = y
+            layerHistory.beginStroke(activeLayerIndex())
             return
         }
-        val color = if (eraseMode) 0x00000000 else paintColor
-        paintColor = color
-        val brush = paintBrushSize
-        if (!doc.inBounds(x, y)) return
-        history.beginStroke()
+        val color = activePaintColor()
+        layerHistory.beginStroke(activeLayerIndex())
+        val start = System.nanoTime()
         mutationExecutor.execute {
-            val d = document ?: return@execute
-            if (!d.inBounds(x, y)) return@execute
-            PixelEngine.drawPixel(d, x, y, color, brush, history)
-            markDirty(x, y, x, y, brush)
+            val d = activeLayerDoc() ?: return@execute
+            ensureMask()
+            val bbox = PaintCore.stamp(
+                d, x, y, color, paintState.brush,
+                effectiveMask(), paintState.symmetry, effectiveMirrorBase(), layerHistory
+            )
+            if (bbox != null) applyEdit(bbox.minX, bbox.minY, bbox.maxX, bbox.maxY)
+            val micros = (System.nanoTime() - start) / 1000L
+            PerfLog.i(TAG, "traço(down) aplicado em $micros µs")
         }
     }
 
-    /** Continuação do traço (move do dedo): segmento Bresenham ao vivo. */
+    /** Continuação do traço na vista 2D/UV (texel): segmento Bresenham ao vivo. */
     fun paintMove(x: Int, y: Int) {
-        val doc = document ?: return
+        val doc = compositeDoc
         if (!doc.inBounds(x, y)) return
-        val color = paintColor
-        val brush = paintBrushSize
+        val tool = paintState.tool
+        if (tool == Tool.LINE || tool == Tool.RECT) { lastPaintX = x; lastPaintY = y; return }
+        if (tool == Tool.FILL || tool == Tool.EYEDROPPER) return
+        val color = activePaintColor()
+        val lx = lastPaintX; val ly = lastPaintY
+        if (lx < 0) return
+        lastPaintX = x; lastPaintY = y
         mutationExecutor.execute {
-            val d = document ?: return@execute
-            val lx = lastPaintX
-            val ly = lastPaintY
-            if (lx >= 0) {
-                if (PixelEngine.drawLine(d, lx, ly, x, y, color, brush, history)) {
-                    markDirty(lx, ly, x, y, brush)
-                }
-            } else if (PixelEngine.drawPixel(d, x, y, color, brush, history)) {
-                markDirty(x, y, x, y, brush)
-            }
-            lastPaintX = x
-            lastPaintY = y
+            val d = activeLayerDoc() ?: return@execute
+            ensureMask()
+            val bbox = PaintCore.drawLineSegment(
+                d, lx, ly, x, y, color, paintState.brush,
+                effectiveMask(), paintState.symmetry, effectiveMirrorBase(), layerHistory
+            )
+            if (bbox != null) applyEdit(bbox.minX, bbox.minY, bbox.maxX, bbox.maxY)
         }
     }
 
-    /** Fim do traço (up do dedo): fecha a entrada única do histórico. */
+    /** Fim do traço na vista 2D/UV: fecha a entrada única do histórico. */
     fun paintEnd() {
-        val doc = document ?: return
+        val tool = paintState.tool
+        val ex = lastPaintX; val ey = lastPaintY
+        val sx = shapeStartX; val sy = shapeStartY
         mutationExecutor.execute {
-            history.commitStroke(doc)
+            val d = activeLayerDoc()
+            if (d == null) {
+                lastPaintX = -1; lastPaintY = -1
+                return@execute
+            }
+            if (tool == Tool.LINE || tool == Tool.RECT) {
+                if (sx >= 0 && ex >= 0) {
+                    ensureMask()
+                    val bbox = if (tool == Tool.LINE) {
+                        PaintCore.drawLineSegment(
+                            d, sx, sy, ex, ey, activePaintColor(), paintState.brush,
+                            effectiveMask(), paintState.symmetry, effectiveMirrorBase(), layerHistory
+                        )
+                    } else {
+                        PaintCore.drawRectOutline(
+                            d, sx, sy, ex, ey, activePaintColor(), paintState.brush,
+                            effectiveMask(), paintState.symmetry, effectiveMirrorBase(), layerHistory
+                        )
+                    }
+                    if (bbox != null) applyEdit(bbox.minX, bbox.minY, bbox.maxX, bbox.maxY)
+                }
+                shapeStartX = -1; shapeStartY = -1
+            }
+            runCatching { layerHistory.commitStroke(layerStack) }
+                .onFailure { PerfLog.w(TAG, "commitStroke: ${it.message}") }
             hasUnsavedChangesLive = true
-            lastPaintX = -1
-            lastPaintY = -1
+            postUnsaved()
+            postPaintState()
+            lastPaintX = -1; lastPaintY = -1
         }
     }
 
-    /** Balde de preenchimento (toque único) — lote nativo, UMA entrada. */
+    // ----- Fonte 3D: raycast → UV → o MESMO funil -----
+
+    /** Pintura 3D — início (u, v do ponto de impacto). */
+    fun paintBeginUv(u: Float, v: Float) {
+        val doc = compositeDoc
+        val x = PaintCore.uvToTexelX(u, doc.width)
+        val y = PaintCore.uvToTexelY(v, doc.height)
+        paintBegin(x, y)
+    }
+
+    /** Pintura 3D — movimento. */
+    fun paintMoveUv(u: Float, v: Float) {
+        val doc = compositeDoc
+        val x = PaintCore.uvToTexelX(u, doc.width)
+        val y = PaintCore.uvToTexelY(v, doc.height)
+        paintMove(x, y)
+    }
+
+    /** Pintura 3D — fim (igual à 2D). */
+    fun paintEndUv() = paintEnd()
+
+    // ----- Operações discretas -----
+
+    /** Balde de preenchimento (toque único) — limitado pela máscara da ilha. */
     fun fillAt(x: Int, y: Int) {
-        val doc = document ?: return
+        val doc = compositeDoc
         if (!doc.inBounds(x, y)) return
-        if (doc.get(x, y) == paintColor) return
-        val color = paintColor
-        val tolerance = fillTolerance
+        val color = if (paintState.tool == Tool.ERASER) 0x00000000 else paintState.color
+        val tolerance = paintState.fillTolerance
         val scratch = strokeScratch
         mutationExecutor.execute {
-            val d = document ?: return@execute
+            val d = activeLayerDoc() ?: return@execute
+            ensureMask()
             val s = scratch ?: NativeEngine.Scratch(d.pixelCount).also { strokeScratch = it }
-            val result = NativeEngine.floodFill(d, x, y, color, tolerance, s)
-            if (result != null && result.changedSomething) {
-                history.commitDeltas(
-                    s.indices, s.before, s.after, result.deltaCount,
-                    result.dirtyX0, result.dirtyY0, result.dirtyX1, result.dirtyY1
+            val mask = effectiveMask()
+            val bbox = IntArray(4)
+            val n = PaintCore.floodFillMasked(
+                d, x, y, color, tolerance, mask,
+                s.indices, s.before, s.after, bbox
+            )
+            if (n > 0) {
+                layerHistory.commitDeltas(
+                    activeLayerIndex(), s.indices, s.before, s.after, n,
+                    bbox[0], bbox[1], bbox[2], bbox[3]
                 )
-                markDirty(result.dirtyX0, result.dirtyY0, result.dirtyX1, result.dirtyY1, 1)
+                applyEdit(bbox[0], bbox[1], bbox[2], bbox[3])
                 hasUnsavedChangesLive = true
+                postUnsaved()
+                postPaintState()
             }
         }
     }
 
-    /** Conta-gotas (toque único): lê a cor do píxel. */
-    fun pickColorAt(x: Int, y: Int): Int? {
-        val doc = document ?: return null
+    /** Balde via UV (3D). */
+    fun fillAtUv(u: Float, v: Float) {
+        val doc = compositeDoc
+        fillAt(PaintCore.uvToTexelX(u, doc.width), PaintCore.uvToTexelY(v, doc.height))
+    }
+
+    /** Conta-gotas em texel (lê a COMPOSIÇÃO — o que o utilizador vê). */
+    fun pickColorTexel(x: Int, y: Int): Int? {
+        val doc = compositeDoc
         if (!doc.inBounds(x, y)) return null
-        return doc.get(x, y)
+        val c = doc.get(x, y)
+        if ((c ushr 24) and 0xFF != 0) setColor(c)
+        return c
+    }
+
+    /** Conta-gotas via UV (3D e UV partilham). */
+    fun pickColorUv(u: Float, v: Float): Int? {
+        val doc = compositeDoc
+        return pickColorTexel(
+            PaintCore.uvToTexelX(u, doc.width), PaintCore.uvToTexelY(v, doc.height)
+        )
     }
 
     fun undo() {
-        val doc = document ?: return
         mutationExecutor.execute {
-            val edit = history.undo(doc) ?: return@execute
-            markDirty(edit.minX, edit.minY, edit.maxX, edit.maxY, 1)
-            hasUnsavedChangesLive = true
+            runCatching {
+                val entry = layerHistory.undo(layerStack) ?: return@execute
+                applyEdit(entry.minX, entry.minY, entry.maxX, entry.maxY)
+                hasUnsavedChangesLive = true
+                postUnsaved()
+            }.onFailure { PerfLog.w(TAG, "undo: ${it.message}") }
+            postPaintState()
         }
     }
 
     fun redo() {
-        val doc = document ?: return
         mutationExecutor.execute {
-            val edit = history.redo(doc) ?: return@execute
-            markDirty(edit.minX, edit.minY, edit.maxX, edit.maxY, 1)
-            hasUnsavedChangesLive = true
+            runCatching {
+                val entry = layerHistory.redo(layerStack) ?: return@execute
+                applyEdit(entry.minX, entry.minY, entry.maxX, entry.maxY)
+                hasUnsavedChangesLive = true
+                postUnsaved()
+            }.onFailure { PerfLog.w(TAG, "redo: ${it.message}") }
+            postPaintState()
         }
     }
 
-    fun canUndo(): Boolean = history.canUndo()
-    fun canRedo(): Boolean = history.canRedo()
+    fun canUndo(): Boolean = layerHistory.canUndo()
+    fun canRedo(): Boolean = layerHistory.canRedo()
 
-    // Estado da ferramenta de pintura (definido pela UI).
-    var paintColor: Int = 0xFFF57C00.toInt()
-    var paintBrushSize: Int = 1
-    var eraseMode: Boolean = false
-    var fillTolerance: Int = 0
+    private fun activePaintColor(): Int =
+        if (paintState.tool == Tool.ERASER) 0x00000000 else paintState.color
 
-    /** Balde armado: o próximo toque preenche (painel do modo Dividido). */
-    var pendingFill: Boolean = false
+    private fun activeLayerIndex(): Int = layerStack.activeIndex
 
-    private var lastPaintX = -1
-    private var lastPaintY = -1
-
-    /** Escrita hasUnsavedChanges segura do executor → main. */
-    @Volatile
-    private var hasUnsavedChangesLive: Boolean = false
+    private fun activeLayerDoc(): PixelDocument? =
+        layerStack.layers.getOrNull(layerStack.activeIndex)?.doc
 
     /**
-     * Região suja: atualiza o bitmap de apresentação (regional, nunca inteiro)
-     * e enfileira a ATUALIZAÇÃO PARCIAL da GPU (glTexSubImage2D).
-     * Corre no executor de mutação — o documento já está estável.
+     * Máscara EFETIVA do traço: só bloqueia quando há ilha selecionada E o
+     * bloqueio está ligado (regra da Ronda B: sem seleção pinta em qualquer
+     * ilha).
      */
-    private fun markDirty(x0: Int, y0: Int, x1: Int, y1: Int, brush: Int) {
-        val doc = document ?: return
+    private fun effectiveMask(): IslandMask? {
+        if (!paintState.lockToIsland) return null
+        return cachedMask
+    }
+
+    private fun effectiveMirrorBase(): MirrorBase =
+        if (effectiveMask() != null) MirrorBase.ISLAND else MirrorBase.TEXTURE
+
+    /** Constrói/reconstrói a máscara se necessário (thread de mutação). */
+    private fun ensureMask() {
+        val sel = selectedIsland.value
+        if (!paintState.lockToIsland || sel == null) { cachedMask = null; return }
+        val key = sel.renderableIndex.toLong() * 1_000_007L +
+            sel.island.id * 97L + paintState.islandPadding * 7L +
+            compositeDoc.width.toLong() * 1_000_003L + compositeDoc.height.toLong()
+        if (cachedMask != null && key == maskKey) return
+        val r = model.renderables.getOrNull(sel.renderableIndex)
+        val uvs = r?.uvs
+        if (r == null || uvs == null) { cachedMask = null; return }
+        val startNanos = System.nanoTime()
+        cachedMask = IslandMask.build(
+            r.indices, uvs, sel.island,
+            compositeDoc.width, compositeDoc.height, paintState.islandPadding
+        )
+        maskKey = key
+        val micros = (System.nanoTime() - startNanos) / 1000L
+        PerfLog.i(TAG, "máscara da ilha ${sel.island.id} (${cachedMask?.activeCount()} texels) em $micros ms")
+    }
+
+    private fun invalidateMask() {
+        cachedMask = null
+        maskKey = -1
+    }
+
+    /**
+     * Região suja: recompose REGIONAL da composição, bitmap de apresentação
+     * (regional, nunca inteiro) e ATUALIZAÇÃO PARCIAL da GPU (glTexSubImage2D).
+     * Corre no executor de mutação — os documentos já estão estáveis.
+     */
+    private fun applyEdit(x0: Int, y0: Int, x1: Int, y1: Int) {
+        val doc = compositeDoc
         val rect = DirtyRectAccumulator()
-            .apply { addStroke(x0, y0, x1, y1, brush) }
+            .apply { add(x0 - 1, y0 - 1, x1 + 1, y1 + 1) }
             .take(doc.width, doc.height) ?: return
+        val w = rect.width
+        val h = rect.height
+        val region = IntArray(w * h)
+        layerStack.composeRegion(rect.x0, rect.y0, w, h, region)
+        doc.writeRegion(rect.x0, rect.y0, w, region)
         // Bitmap de apresentação: só a região (mesma técnica do editor 2D).
         val bmp = presentationBitmap.value
         if (bmp != null && bmp.width == doc.width && bmp.height == doc.height) {
-            val region = IntArray(rect.width * rect.height)
-            var i = 0
-            for (y in rect.y0..rect.y1) {
-                for (x in rect.x0..rect.x1) {
-                    region[i++] = doc.get(x, y)
-                }
-            }
-            bmp.setPixels(region, 0, rect.width, rect.x0, rect.y0, rect.width, rect.height)
+            bmp.setPixels(region, 0, w, rect.x0, rect.y0, w, h)
         }
-        // GPU: APENAS a região suja (requisito do modo Dividido).
+        // GPU: APENAS a região suja (requisito do modo Dividido / Ronda B).
         renderer?.updateTextureRegion(rect, { doc.getAt(it) }, doc.width)
         // Redesenho da superfície 2D (bitmap já foi atualizado regionalmente).
         viewModelScope.launch(Dispatchers.Main) {
@@ -331,9 +583,159 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         if (hasUnsavedChangesLive) postUnsaved()
     }
 
+    /** Recomposição TOTAL (operações estruturais de camadas / abrir / novo). */
+    private fun recomposeAll() {
+        val doc = compositeDoc
+        val full = layerStack.compose()
+        doc.writeRegion(0, 0, doc.width, full)
+        val bmp = presentationBitmap.value
+        if (bmp != null && bmp.width == doc.width && bmp.height == doc.height) {
+            bmp.setPixels(full, 0, doc.width, 0, 0, doc.width, doc.height)
+        }
+        renderer?.updateTextureRegion(DirtyRect(0, 0, doc.width - 1, doc.height - 1), { doc.getAt(it) }, doc.width)
+        viewModelScope.launch(Dispatchers.Main) {
+            paintVersion.value = (paintVersion.value ?: 0) + 1
+            postLayersState()
+        }
+        invalidateMask()
+    }
+
     private fun postUnsaved() {
         viewModelScope.launch(Dispatchers.Main) {
             hasUnsavedChanges.value = true
+        }
+    }
+
+    private fun postLayersState() {
+        layersState = layerStack.layers.mapIndexed { i, l ->
+            LayerRow(i, l.id, l.name, l.visible, l.opacity, i == layerStack.activeIndex)
+        }
+        layers.postValue(layersState)
+    }
+
+    // ------------------------------------------------------------------
+    // CAMADAS (Ronda B) — operações estruturais (executor; recomposição total)
+    // ------------------------------------------------------------------
+
+    /** Adiciona uma camada NO TOPO (erro recuperável se exceder limites). */
+    fun addLayer() {
+        mutationExecutor.execute {
+            try {
+                layerStack.addLayer()
+                hasUnsavedChangesLive = true
+                postUnsaved()
+                statusMessage.postValue("Camada adicionada (${layerStack.count}/${LayerStack.MAX_LAYERS})")
+            } catch (e: LayerStack.LayerLimitException) {
+                statusMessage.postValue(e.message ?: "Limite de camadas atingido")
+            }
+            recomposeAll()
+        }
+    }
+
+    /** Remove a camada [index] (a última não é removível). */
+    fun removeLayer(index: Int) {
+        mutationExecutor.execute {
+            if (layerStack.count <= 1) {
+                statusMessage.postValue("Não é possível remover a última camada")
+                return@execute
+            }
+            layerStack.removeLayer(index)
+            hasUnsavedChangesLive = true
+            postUnsaved()
+            statusMessage.postValue("Camada removida")
+            recomposeAll()
+        }
+    }
+
+    fun selectLayer(index: Int) {
+        mutationExecutor.execute {
+            layerStack.setActive(index)
+            postLayersState()
+        }
+    }
+
+    fun toggleLayerVisible(index: Int) {
+        mutationExecutor.execute {
+            layerStack.toggleVisible(index)
+            hasUnsavedChangesLive = true
+            postUnsaved()
+            recomposeAll()
+        }
+    }
+
+    fun setLayerOpacity(index: Int, opacity: Int) {
+        mutationExecutor.execute {
+            layerStack.setOpacity(index, opacity)
+            hasUnsavedChangesLive = true
+            recomposeAll()
+        }
+    }
+
+    fun moveLayerUp(index: Int) {
+        mutationExecutor.execute {
+            if (layerStack.moveUp(index)) {
+                hasUnsavedChangesLive = true
+                postUnsaved()
+            }
+            recomposeAll()
+        }
+    }
+
+    fun moveLayerDown(index: Int) {
+        mutationExecutor.execute {
+            if (layerStack.moveDown(index)) {
+                hasUnsavedChangesLive = true
+                postUnsaved()
+            }
+            recomposeAll()
+        }
+    }
+
+    /**
+     * Preenche a camada ATIVA com o xadrez de TESTE (visibilidade de UVs e
+     * costuras). Uma entrada de histórico (desfazível). Limitado a docs
+     * pequenos para não estourar o orçamento de histórico em 4 GB.
+     */
+    fun fillWithTestChecker() {
+        val doc = compositeDoc
+        if (doc.width * doc.height > 512 * 512) {
+            statusMessage.value = "Xadrez de teste disponível até 512×512 (esta textura é " +
+                "${doc.width}×${doc.height})"
+            return
+        }
+        mutationExecutor.execute {
+            val d = activeLayerDoc() ?: return@execute
+            val n = d.pixelCount
+            val indices = IntArray(n); val before = IntArray(n); val after = IntArray(n)
+            var count = 0
+            var minX = Int.MAX_VALUE; var maxX = Int.MIN_VALUE
+            var minY = Int.MAX_VALUE; var maxY = Int.MIN_VALUE
+            for (y in 0 until d.height) {
+                for (x in 0 until d.width) {
+                    val idx = y * d.width + x
+                    val checker = ((x / 8) + (y / 8)) % 2 == 0
+                    val newColor = if (checker) TEST_CHECKER_A else TEST_CHECKER_B
+                    val old = d.getAt(idx)
+                    if (old == newColor) continue
+                    indices[count] = idx; before[count] = old; after[count] = newColor
+                    d.setAt(idx, newColor)
+                    count++
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+            if (count > 0) {
+                layerHistory.commitDeltas(
+                    activeLayerIndex(), indices, before, after, count, minX, minY, maxX, maxY
+                )
+                applyEdit(minX, minY, maxX, maxY)
+                hasUnsavedChangesLive = true
+                postUnsaved()
+                statusMessage.postValue("Xadrez de teste aplicado à camada ativa")
+                postPaintState()
+            }
         }
     }
 
@@ -513,12 +915,15 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         this.bindings.value = bindingsOverride
         this.selectedMaterial.value = 0
         this.selectedIsland.value = null
+        lastPickTriangle = -1
+        lastPickRenderable = -1
         // Modo pode ter de recuar se o novo modelo não tiver UV.
         if (!model.hasUv && (mode.value == StudioMode.UV || mode.value == StudioMode.SPLIT)) {
             this.mode.value = StudioMode.THREE_D
         }
         computeIslands()
         fitCameraToModel()
+        invalidateMask()
         renderer?.let { r ->
             r.setScene(model, embedded, bindingsOverride, sampling.value ?: SamplingMode.NEAREST)
             r.setHighlight(null, null)
@@ -570,7 +975,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun selectFaceAtNdc(ndcX: Float, ndcY: Float, aspect: Float) {
         val ray = MeshPicking.rayFromNdc(camera, ndcX, ndcY, aspect)
-        val hit = MeshPicking.pick(model, ray)
+        val hit = pickCached(model, ray)
         if (hit == null) {
             // Toque fora do modelo: limpa a seleção (comportamento previsível).
             clearIslandSelection()
@@ -583,7 +988,95 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         }
         selectedIsland.value = IslandSelection(hit.renderableIndex, island, hit.triangleIndex)
         selectedMaterial.value = model.renderables.getOrNull(hit.renderableIndex)?.materialIndex
+        invalidateMask()
+        postPaintState()
         applyHighlightToRenderer()
+    }
+
+    /**
+     * Raycast com cache do último triângulo (Ronda B — pintura por movimento):
+     * testa PRIMEIRO o último triângulo tocado (traços concentram-se numa
+     * face); se falhar, varre o modelo completo. Corretude idêntica ao
+     * [MeshPicking.pick]; apenas evita re-testar tudo quando o dedo fica na
+     * mesma face.
+     */
+    private fun pickCached(m: GltfModel, ray: MeshPicking.Ray): MeshPicking.PickHit? {
+        val lr = lastPickRenderable
+        val lt = lastPickTriangle
+        if (lr >= 0 && lt >= 0) {
+            val r = m.renderables.getOrNull(lr)
+            if (r != null) {
+                val i = lt * 3
+                if (i + 2 < r.indices.size) {
+                    val pos = r.positions
+                    val a = r.indices[i] * 3; val b = r.indices[i + 1] * 3; val c = r.indices[i + 2] * 3
+                    val t = MeshPicking.rayTriangleT(
+                        ray, pos[a], pos[a + 1], pos[a + 2],
+                        pos[b], pos[b + 1], pos[b + 2],
+                        pos[c], pos[c + 1], pos[c + 2]
+                    )
+                    if (t != null) {
+                        return MeshPicking.PickHit(
+                            renderableIndex = lr, triangleIndex = lt, distance = t,
+                            point = floatArrayOf(
+                                ray.ox + ray.dx * t, ray.oy + ray.dy * t, ray.oz + ray.dz * t
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        val hit = MeshPicking.pick(m, ray)
+        if (hit != null) {
+            lastPickRenderable = hit.renderableIndex
+            lastPickTriangle = hit.triangleIndex
+        } else {
+            lastPickRenderable = -1
+            lastPickTriangle = -1
+        }
+        return hit
+    }
+
+    /**
+     * TOQUE/ARRASTO NO MODELO 3D durante a PINTURA (Ronda B): raycast →
+     * UV no ponto de impacto (baricêntricas) → funil de pintura. Devolve
+     * true se acertou no modelo (para a UI saber se o traço começou).
+     */
+    fun paintAtNdc(ndcX: Float, ndcY: Float, aspect: Float, isStart: Boolean): Boolean {
+        val ray = MeshPicking.rayFromNdc(camera, ndcX, ndcY, aspect)
+        val hit = pickCached(model, ray)
+        if (hit == null) return false
+        val r = model.renderables.getOrNull(hit.renderableIndex)
+        val uvs = r?.uvs ?: return false
+        val i = hit.triangleIndex * 3
+        if (i + 2 >= r.indices.size) return false
+        val uv = PaintCore.uvAtHit(
+            hit.point, r.positions,
+            r.indices[i], r.indices[i + 1], r.indices[i + 2], uvs
+        ) ?: return false
+        if (isStart) paintBeginUv(uv[0], uv[1]) else paintMoveUv(uv[0], uv[1])
+        return true
+    }
+
+    /** Operação discreta (balde/conta-gotas) por raio 3D (Ronda B). */
+    fun discreteAtNdc(ndcX: Float, ndcY: Float, aspect: Float): Boolean {
+        val ray = MeshPicking.rayFromNdc(camera, ndcX, ndcY, aspect)
+        val hit = pickCached(model, ray)
+        if (hit == null) return false
+        val r = model.renderables.getOrNull(hit.renderableIndex)
+        val uvs = r?.uvs ?: return false
+        val i = hit.triangleIndex * 3
+        if (i + 2 >= r.indices.size) return false
+        val uv = PaintCore.uvAtHit(
+            hit.point, r.positions,
+            r.indices[i], r.indices[i + 1], r.indices[i + 2], uvs
+        ) ?: return false
+        when (paintState.tool) {
+            Tool.FILL -> fillAtUv(uv[0], uv[1])
+            Tool.EYEDROPPER -> pickColorUv(uv[0], uv[1])
+            else -> return false
+        }
+        return true
     }
 
     /** Ilha de uma primitiva que contém o triângulo dado (busca linear — só no toque). */
@@ -605,17 +1098,20 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
                 selectedIsland.value = IslandSelection(index, hit)
                 applyHighlightToRenderer()
                 selectedMaterial.value = r.materialIndex
+                invalidateMask()
+                postPaintState()
                 return
             }
         }
         // Toque fora de qualquer ilha: limpa a seleção (comportamento previsível).
-        selectedIsland.value = null
-        renderer?.setHighlight(null, null)
+        clearIslandSelection()
     }
 
     fun clearIslandSelection() {
         selectedIsland.value = null
         renderer?.setHighlight(null, null)
+        invalidateMask()
+        postPaintState()
     }
 
     /**
@@ -689,49 +1185,69 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
-    // Persistência (.osp v2 com studio3d.json)
+    // Persistência (.osp v3: composição + camadas + studio3d.json)
     // ------------------------------------------------------------------
 
-    /** Cria uma textura nova (dimensões dadas) — limpa o histórico. */
+    /**
+     * Cria uma textura nova (dimensões dadas) — UMA camada "Base" transparente,
+     * histórico limpo.
+     */
     fun newTexture(name: String, width: Int, height: Int) {
         newTextureInternal(IntArray(width * height), width, height, name)
         statusMessage.value = "Nova textura ${width}x${height}"
     }
 
     private fun newTextureInternal(pixels: IntArray, width: Int, height: Int, name: String) {
-        val doc = PixelDocument(width, height, pixels)
-        document = doc
-        strokeScratch = NativeEngine.Scratch(doc.pixelCount)
-        history = HistoryManager()
+        val stack = LayerStack(width, height)
+        stack.seedSingleLayer(pixels)
+        layerStack = stack
+        layerHistory.clear()
+        compositeDoc = PixelDocument(width, height, pixels.copyOf())
+        strokeScratch = NativeEngine.Scratch(compositeDoc.pixelCount)
         project = repository.createProject(name)
         projectName.value = name
         hasUnsavedChangesLive = false
         hasUnsavedChanges.value = false
-        // Bitmap de apresentação alinhado com o documento.
+        // Bitmap de apresentação alinhado com a composição.
         presentationBitmap.value = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
-            setPixels(pixels, 0, width, 0, 0, width, height)
+            setPixels(compositeDoc.copyPixels(), 0, width, 0, 0, width, height)
         }
-        renderer?.replaceDocumentTexture(doc.copyPixels(), width, height)
+        postLayersState()
+        postPaintState()
+        invalidateMask()
+        renderer?.replaceDocumentTexture(compositeDoc.copyPixels(), width, height)
         renderer?.setScene(model, embeddedBitmaps, bindings.value ?: emptyMap(), sampling.value ?: SamplingMode.NEAREST)
     }
+
+    private var project: PixelProject? = null
 
     /** Lista de projetos guardados (diálogo "Abrir projeto"). */
     fun listProjectsSnapshot(): List<PixelProject> =
         try { repository.listProjects() } catch (e: Exception) { emptyList() }
 
-    /** Guarda o projeto .osp (v2) com a secção 3D (referências + câmara). */
+    /**
+     * Guarda o projeto .osp (v3): pixels.rgba = COMPOSIÇÃO; layers.json +
+     * layer-N.rgba = camadas; studio3d.json = referências 3D (v2).
+     */
     fun saveProject() {
-        val doc = document ?: return
+        val stack = layerStack
         val proj = project ?: return
         mutationExecutor.execute {
             try {
                 val state = buildStudio3DState()
                 val json = MiniJson.write(state.toJson())
-                repository.saveDocument(proj, doc, null, json)
+                val layersJson = LayersCodec.toJson(stack)
+                val layerPixels = stack.layers.map { it.doc.toRgbaBytes() }
+                val section = OspCodecLayersSection(layersJson, layerPixels)
+                // Paleta guardada = cores recentes (hex ARGB) — reuse do manifesto.
+                val palette = paintState.recentColors.map { "#%08X".format(it) }
+                repository.saveDocument(proj, compositeDoc, palette, json, section)
                 hasUnsavedChangesLive = false
                 viewModelScope.launch(Dispatchers.Main) {
                     hasUnsavedChanges.value = false
-                    statusMessage.value = "Projeto guardado (${doc.width}x${doc.height}) com estado 3D"
+                    statusMessage.value =
+                        "Projeto guardado (${compositeDoc.width}x${compositeDoc.height}) " +
+                            "com ${stack.count} camada(s) e estado 3D"
                 }
             } catch (e: Exception) {
                 viewModelScope.launch(Dispatchers.Main) {
@@ -741,7 +1257,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Abre um projeto .osp existente (v1 sem 3D ou v2 com 3D). */
+    private fun OspCodecLayersSection(json: String, pixels: List<ByteArray>) =
+        com.pixelone.studio.osp.OspCodec.LayersSection(json, pixels)
+
+    /** Abre um projeto .osp existente (v1/v2 sem camadas; v3 com camadas). */
     fun openProject(id: String) {
         viewModelScope.launch(Dispatchers.Default) {
             try {
@@ -758,14 +1277,37 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun applyLoadedProject(loaded: FileSystemProjectRepository.LoadedProjectData) {
         val doc = loaded.document
-        document = doc
+        val stack: LayerStack = if (loaded.layers != null) {
+            try {
+                LayersCodec.fromRgbaList(doc.width, doc.height, loaded.layers.layerPixels, loaded.layers.json)
+            } catch (e: Exception) {
+                // Camadas inválidas: abre com a composição como 1 camada (seguro).
+                statusMessage.value = "Camadas ignoradas (${e.message}) — aberto como 1 camada"
+                LayerStack(doc.width, doc.height).apply { seedSingleLayer(doc.copyPixels()) }
+            }
+        } else {
+            // Projetos v1/v2: UMA camada (regra da Ronda B).
+            LayerStack(doc.width, doc.height).apply { seedSingleLayer(doc.copyPixels()) }
+        }
+        layerStack = stack
+        layerHistory.clear()
         strokeScratch = NativeEngine.Scratch(doc.pixelCount)
-        history = HistoryManager()
         project = loaded.project
         projectName.value = loaded.project.name
-        presentationBitmap.value = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
-        doc.copyPixels().let { pixels ->
-            presentationBitmap.value?.setPixels(pixels, 0, doc.width, 0, 0, doc.width, doc.height)
+        val composed = stack.compose()
+        compositeDoc = PixelDocument(doc.width, doc.height, composed)
+        presentationBitmap.value = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888).apply {
+            setPixels(composed, 0, doc.width, 0, 0, doc.width, doc.height)
+        }
+        // Paleta guardada (cores recentes) volta do manifesto.
+        loaded.palette?.takeIf { it.isNotEmpty() }?.let { hexes ->
+            val colors = hexes.mapNotNull { hex ->
+                hex.removePrefix("#").toLongOrNull(16)?.toInt()
+            }.take(MAX_RECENTS)
+            if (colors.isNotEmpty()) {
+                paintState = paintState.copy(recentColors = colors)
+                paint.value = paintState
+            }
         }
         // Estado 3D (opcional — v1 abre sem estado).
         var appliedMode: StudioMode? = null
@@ -794,7 +1336,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         }
         hasUnsavedChangesLive = false
         hasUnsavedChanges.value = false
-        renderer?.replaceDocumentTexture(doc.copyPixels(), doc.width, doc.height)
+        postLayersState()
+        postPaintState()
+        invalidateMask()
+        renderer?.replaceDocumentTexture(compositeDoc.copyPixels(), doc.width, doc.height)
         renderer?.setScene(model, embeddedBitmaps, bindings.value ?: emptyMap(), sampling.value ?: SamplingMode.NEAREST)
         // Modo guardado só se o modelo atual permitir.
         appliedMode?.let { if (model.hasUv) mode.value = it }
@@ -822,9 +1367,9 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     // Partilha com o Texture Studio ("Pintar esta textura")
     // ------------------------------------------------------------------
 
-    /** Publica a textura atual no bus para o Texture Studio abrir. */
+    /** Publica a COMPOSIÇÃO atual no bus para o Texture Studio abrir. */
     fun publishTextureToStudio2D() {
-        val doc = document ?: return
+        val doc = compositeDoc
         StudioSharedBus.publishTo2D(
             StudioSharedBus.TextureHandoff(
                 name = project?.name ?: "textura-3d",
@@ -839,24 +1384,72 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Adota a textura mais recente do Texture Studio (se existir).
-     * Chamada ao voltar ao estúdio 3D — o 3D atualiza SEM reiniciar projeto.
+     * RONDA B: se as dimensões coincidirem, os píxeis entram NA CAMADA ATIVA
+     * (UMA entrada de histórico — as outras camadas e o histórico sobrevivem);
+     * se as dimensões diferirem, a pilha é substituída por UMA camada.
      */
     fun adoptFromStudio2D(): Boolean {
         val handoff = StudioSharedBus.consumeFrom2D() ?: return false
         if (handoff.width <= 0 || handoff.height <= 0) return false
-        val doc = PixelDocument(handoff.width, handoff.height, handoff.pixels)
-        document = doc
-        strokeScratch = NativeEngine.Scratch(doc.pixelCount)
-        history = HistoryManager()
-        presentationBitmap.value = Bitmap.createBitmap(handoff.width, handoff.height, Bitmap.Config.ARGB_8888).apply {
-            setPixels(handoff.pixels, 0, handoff.width, 0, 0, handoff.width, handoff.height)
+        if (handoff.width == compositeDoc.width && handoff.height == compositeDoc.height) {
+            val idx = IntArray(handoff.pixels.size)
+            val before = IntArray(handoff.pixels.size)
+            val after = IntArray(handoff.pixels.size)
+            var n = 0
+            var minX = Int.MAX_VALUE; var maxX = Int.MIN_VALUE
+            var minY = Int.MAX_VALUE; var maxY = Int.MIN_VALUE
+            val layer = layerStack.active()
+            for (y in 0 until handoff.height) {
+                for (x in 0 until handoff.width) {
+                    val i = y * handoff.width + x
+                    val newColor = handoff.pixels[i]
+                    val old = layer.doc.getAt(i)
+                    if (old == newColor) continue
+                    idx[n] = i; before[n] = old; after[n] = newColor
+                    layer.doc.setAt(i, newColor)
+                    n++
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+            if (n > 0) {
+                layerHistory.commitDeltas(
+                    layerStack.activeIndex, idx, before, after, n, minX, minY, maxX, maxY
+                )
+                applyEdit(minX, minY, maxX, maxY)
+            }
+            statusMessage.value = "Textura do Texture Studio aplicada à camada ativa " +
+                "(${handoff.width}x${handoff.height})"
+        } else {
+            // Dimensões diferentes: substitui a pilha (documentado no relatório).
+            val stack = LayerStack(handoff.width, handoff.height)
+            stack.seedSingleLayer(handoff.pixels.copyOf())
+            layerStack = stack
+            layerHistory.clear()
+            strokeScratch = NativeEngine.Scratch(handoff.width * handoff.height)
+            compositeDoc = PixelDocument(handoff.width, handoff.height, handoff.pixels.copyOf())
+            presentationBitmap.value = Bitmap.createBitmap(
+                handoff.width, handoff.height, Bitmap.Config.ARGB_8888
+            ).apply {
+                setPixels(handoff.pixels, 0, handoff.width, 0, 0, handoff.width, handoff.height)
+            }
+            statusMessage.value = "Textura substituída pelo Texture Studio " +
+                "(${handoff.width}x${handoff.height}) — 1 camada"
+            renderer?.replaceDocumentTexture(compositeDoc.copyPixels(), handoff.width, handoff.height)
         }
         hasUnsavedChangesLive = true
         hasUnsavedChanges.value = true
-        statusMessage.value = "Textura atualizada pelo Texture Studio (${handoff.width}x${handoff.height})"
-        renderer?.replaceDocumentTexture(doc.copyPixels(), doc.width, doc.height)
+        postLayersState()
+        postPaintState()
+        invalidateMask()
         return true
     }
+
+    // ------------------------------------------------------------------
+    // Guias UV e realce de ilha (consumidos pelas vistas)
+    // ------------------------------------------------------------------
 
     /** Segmentos UV (u0,v0,u1,v1) das ilhas — guia para a pintura/overlay.
      *  @param meshFilter índice de malha para filtrar (null = todas). */
@@ -886,8 +1479,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
      * Triângulos da ilha selecionada em TRIPLOS de vértice (ax,ay,bx,by,cx,cy)
      * — 6 floats por triângulo. Formato consumido por
      * [com.pixelone.studio.ui.texture3d.TexturePaintView] para o path fechado
-     * de realce (fill + stroke) — o formato antigo de segmentos gerava fills
-     * degenerados (problema H da Ronda A).
+     * de realce (fill + stroke).
      */
     fun islandHighlightSegments(): FloatArray? {
         val sel = selectedIsland.value ?: return null
@@ -903,6 +1495,78 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         return FloatArray(out.size) { out[it] }
     }
 
+    /** Píxeis da composição (exportações PNG — textura e gabarito UV). */
+    fun compositePixels(): IntArray? = compositeDoc.copyPixels()
+
+    /**
+     * EXPORTAR TEXTURA (Ronda B): grava a COMPOSIÇÃO das camadas visíveis
+     * como PNG no destino SAF escolhido (sem permissões, sem MediaStore).
+     */
+    fun exportTextureTo(uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val doc = compositeDoc
+                val bmp = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
+                bmp.setPixels(doc.copyPixels(), 0, doc.width, 0, 0, doc.width, doc.height)
+                val out = getApplication<Application>().contentResolver.openOutputStream(uri)
+                    ?: throw java.io.IOException("Não foi possível abrir o destino")
+                val ok = out.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                bmp.recycle()
+                if (!ok) throw java.io.IOException("Falha ao codificar o PNG")
+                withContext(Dispatchers.Main) {
+                    statusMessage.value = "Textura exportada (${doc.width}x${doc.height}, PNG)"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    statusMessage.value = "Falha ao exportar textura: ${e.message}"
+                }
+            }
+        }
+    }
+
+    /**
+     * EXPORTAR GABARITO UV (Ronda B): PNG com as linhas UV (1 px, finas) sobre
+     * fundo TRANSPARENTE — para uso como guia de pintura externa.
+     */
+    fun exportUvTemplateTo(uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val doc = compositeDoc
+                val bmp = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
+                // Fundo transparente (allocateDirect-like: createBitmap já vem a 0).
+                val canvas = android.graphics.Canvas(bmp)
+                val linePaint = android.graphics.Paint().apply {
+                    color = 0xFFFFFFFF.toInt()
+                    strokeWidth = 1f
+                    style = android.graphics.Paint.Style.STROKE
+                    isAntiAlias = false
+                }
+                val segments = uvWireframeSegments(null)
+                canvas.scale(doc.width.toFloat(), doc.height.toFloat())
+                linePaint.strokeWidth = 1f / doc.width
+                var i = 0
+                while (i + 3 < segments.size) {
+                    canvas.drawLine(
+                        segments[i], segments[i + 1], segments[i + 2], segments[i + 3], linePaint
+                    )
+                    i += 4
+                }
+                val out = getApplication<Application>().contentResolver.openOutputStream(uri)
+                    ?: throw java.io.IOException("Não foi possível abrir o destino")
+                val ok = out.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                bmp.recycle()
+                if (!ok) throw java.io.IOException("Falha ao codificar o PNG")
+                withContext(Dispatchers.Main) {
+                    statusMessage.value = "Gabarito UV exportado (${doc.width}x${doc.height}, PNG)"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    statusMessage.value = "Falha ao exportar gabarito: ${e.message}"
+                }
+            }
+        }
+    }
+
     private fun sha256Of(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
         return digest.joinToString("") { "%02x".format(it) }
@@ -913,5 +1577,26 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private const val TAG = "PixelOnePerf/3D"
+
+        /** Tamanhos de pincel da Ronda B (requisito: 1, 2, 3, 4 e 8 px). */
+        val BRUSH_SIZES: List<Int> = listOf(1, 2, 3, 4, 8)
+        const val PixelBrushMax: Int = 8
+
+        /** Laranja Pixel One por defeito da pintura. */
+        const val DEFAULT_COLOR: Int = 0xFFF57C00.toInt()
+
+        /** Máximo de cores recentes (persistem na paleta do manifesto). */
+        const val MAX_RECENTS: Int = 12
+
+        /** Padding/dilatação por defeito à volta das ilhas (regra da Ronda B). */
+        const val DEFAULT_PADDING: Int = 2
+
+        /** Cores do xadrez de teste (iguais às da textura demo). */
+        const val TEST_CHECKER_A: Int = 0xFF2E2E2E.toInt()
+        const val TEST_CHECKER_B: Int = 0xFF1A1A1A.toInt()
+
+        val DEFAULT_RECENTS: List<Int> = listOf(
+            0xFFF57C00.toInt(), 0xFFE6E6E6.toInt(), 0xFF2E2E2E.toInt(), 0xFF000000.toInt()
+        )
     }
 }

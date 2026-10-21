@@ -121,6 +121,9 @@ class ModelRenderer(
 
     private var sampling: SamplingMode = SamplingMode.NEAREST
 
+    /** Wireframe (Ronda B) — estado aplicado na thread GL via fila de comandos. */
+    private var wireframeEnabled = false
+
     private var highlightRenderable: Int? = null
     private var highlightTriangles: IntArray? = null
     private var highlightIbo = 0
@@ -209,6 +212,20 @@ class ModelRenderer(
             highlightRenderable = renderableIndex
             highlightTriangles = islandTriangles
             rebuildHighlightBuffer()
+        }
+    }
+
+    /**
+     * Interruptor de WIREFRAME (Ronda B — visualização): desenha as arestas
+     * dos triângulos em laranja por cima da superfície. Construção do IBO de
+     * linhas é LAZY (1.ª vez que é mostrado) e por primitiva.
+     */
+    fun setWireframe(enabled: Boolean) {
+        pendingOps.add {
+            if (wireframeEnabled != enabled) {
+                wireframeEnabled = enabled
+                if (enabled) scene?.renderables?.forEach { ensureWireIbo(it) }
+            }
         }
     }
 
@@ -311,6 +328,87 @@ class ModelRenderer(
             GLES20.glDisable(GLES20.GL_POLYGON_OFFSET_FILL)
             GLES20.glUniform1f(locHighlight, 0f)
         }
+
+        // WIREFRAME (Ronda B): arestas em laranja por cima da superfície.
+        if (wireframeEnabled) drawWireframe(current)
+    }
+
+    /** Desenha as arestas de TODAS as primitivas (gl.LINES, cor laranja). */
+    private fun drawWireframe(current: GlScene) {
+        // Cor de linhas sobre o modelo (uniformes do MESMO programa).
+        GLES20.glUniform4f(locBaseColor, 0.96f, 0.55f, 0.05f, 1f)
+        GLES20.glUniform1f(locUseTexture, 0f)
+        GLES20.glUniform1f(locAlphaMode, 0f)
+        GLES20.glUniform1f(locHighlight, 0f)
+        GLES20.glLineWidth(1f)
+        // LEQUAL: linhas coplanares com a superfície passam o teste de profundidade.
+        GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+        GLES20.glDepthMask(false)
+        for (r in current.renderables) {
+            ensureWireIbo(r)
+            if (r.wireIbo != 0 && r.wireIndexCount > 0) {
+                drawElementsWithBuffers(r, r.wireIbo, r.wireIndexCount, r.wireIndexType)
+            }
+        }
+        GLES20.glDepthMask(true)
+        GLES20.glDepthFunc(GLES20.GL_LESS)
+    }
+
+    /** Constrói o IBO de linhas da primitiva (uma vez — 3 arestas por triângulo). */
+    private fun ensureWireIbo(r: GlRenderable) {
+        if (r.wireIbo != 0) return
+        val triCount = r.indexCount / 3
+        if (triCount <= 0) return
+        if (triCount * 3 > 65535) {
+            // Nº de vértices > 65535: índices de linhas em UINT (ES 3.0).
+            val indices = IntArray(triCount * 6)
+            var o = 0
+            var i = 0
+            while (i + 2 < r.source.indices.size) {
+                val a = r.source.indices[i]; val b = r.source.indices[i + 1]; val c = r.source.indices[i + 2]
+                indices[o++] = a; indices[o++] = b
+                indices[o++] = b; indices[o++] = c
+                indices[o++] = c; indices[o++] = a
+                i += 3
+            }
+            val intBuf = directIntBuffer(indices.size).put(indices)
+            intBuf.position(0)
+            val ibo = IntArray(1); GLES20.glGenBuffers(1, ibo, 0)
+            if (ibo[0] == 0) return
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ibo[0])
+            GLES20.glBufferData(
+                GLES20.GL_ELEMENT_ARRAY_BUFFER, intBuf.capacity() * 4, intBuf, GLES20.GL_STATIC_DRAW
+            )
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+            r.wireIbo = ibo[0]
+            r.wireIndexCount = indices.size
+            r.wireIndexType = GLES30.GL_UNSIGNED_INT
+        } else {
+            val indices = ShortArray(triCount * 6)
+            var o = 0
+            var i = 0
+            while (i + 2 < r.source.indices.size) {
+                val a = r.source.indices[i]; val b = r.source.indices[i + 1]; val c = r.source.indices[i + 2]
+                indices[o++] = a.toShort(); indices[o++] = b.toShort()
+                indices[o++] = b.toShort(); indices[o++] = c.toShort()
+                indices[o++] = c.toShort(); indices[o++] = a.toShort()
+                i += 3
+            }
+            val shortBuf = ByteBuffer.allocateDirect(indices.size * 2)
+                .order(ByteOrder.nativeOrder()).asShortBuffer()
+            shortBuf.put(indices)
+            shortBuf.position(0)
+            val ibo = IntArray(1); GLES20.glGenBuffers(1, ibo, 0)
+            if (ibo[0] == 0) return
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ibo[0])
+            GLES20.glBufferData(
+                GLES20.GL_ELEMENT_ARRAY_BUFFER, shortBuf.capacity() * 2, shortBuf, GLES20.GL_STATIC_DRAW
+            )
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+            r.wireIbo = ibo[0]
+            r.wireIndexCount = indices.size
+            r.wireIndexType = GLES20.GL_UNSIGNED_SHORT
+        }
     }
 
     // ------------------------------------------------------------------
@@ -324,7 +422,11 @@ class ModelRenderer(
         val indexIbo: Int,
         val indexCount: Int,
         val indexType: Int,
-        val alphaModeInt: Int
+        val alphaModeInt: Int,
+        /** IBO de LINHAS do wireframe (lazy — construído ao ativar o modo). */
+        var wireIbo: Int = 0,
+        var wireIndexCount: Int = 0,
+        var wireIndexType: Int = 0
     )
 
     private class GlScene(
@@ -654,6 +756,7 @@ class ModelRenderer(
         current.renderables.forEach {
             buffers.add(it.indexIbo); buffers.add(it.positionVbo)
             if (it.uvVbo != 0) buffers.add(it.uvVbo)
+            if (it.wireIbo != 0) buffers.add(it.wireIbo)
         }
         if (buffers.isNotEmpty()) {
             val arr = buffers.toIntArray()
