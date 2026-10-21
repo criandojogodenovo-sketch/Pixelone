@@ -1,16 +1,20 @@
 # Formato nativo de projeto do Pixel One — `.osp`
 
-**Versão do formato: 2** (`OspCodec.FORMAT_VERSION` — v2 adiciona a secção
-opcional do 3D Texture Studio; projetos v1 continuam a abrir sem alterações)
+**Versão do formato: 3** (`OspCodec.FORMAT_VERSION` — v3, Ronda B, adiciona
+CAMADAS; v2 adicionou a secção opcional do 3D Texture Studio; projetos v1/v2
+continuam a abrir sem alterações e v3 abrem nas versões antigas da app
+porque `pixels.rgba` continua a guardar a composição)
 
-O `.osp` (*One Sprite Project*) é um contentor ZIP com até três entradas,
+O `.osp` (*One Sprite Project*) é um contentor ZIP com até 8 entradas,
 por esta ordem:
 
 | # | Entrada | Conteúdo |
 | --- | --- | --- |
 | 1 | `manifest.json` | Metadados em JSON UTF-8 (máx. 64 KB) |
-| 2 | `pixels.rgba` | Píxeis brutos, 4 bytes por píxel, ordem R,G,B,A |
+| 2 | `pixels.rgba` | Píxeis brutos, 4 bytes por píxel, ordem R,G,B,A — em v3, a COMPOSIÇÃO das camadas visíveis |
 | 3 | `studio3d.json` | **Opcional (v2)** — referências do 3D Texture Studio (máx. 64 KB) |
+| 4 | `layers.json` | **Opcional (v3, Ronda B)** — metadados das camadas (máx. 16 KB) |
+| 5+ | `layer-N.rgba` | **Opcional (v3)** — píxeis crus de cada camada, NA ORDEM da pilha (baixo→topo), N = 0..3 |
 
 ## manifest.json
 
@@ -30,7 +34,8 @@ por esta ordem:
 
 - `format` — identificador fixo `"pixel-one-osp"`. Valores diferentes
   rejeitam o ficheiro com erro controlado.
-- `formatVersion` — versão do formato (2 desde a Fase 3). Uma versão
+- `formatVersion` — versão do formato (3 desde a Ronda B da Fase 3; v2 =
+  Fase 3 base). Uma versão
   **maior** que a suportada pela aplicação é rejeitada com a mensagem
   *"Formato .osp versão X não suportado…"* — os dados locais nunca são
   corrompidos. A versão 1 (Fases 0–2, sem secção 3D) abre normalmente —
@@ -106,3 +111,34 @@ pedir reimportação quando necessário). Schema `schemaVersion: 1`:
   tiver UV).
 - A entrada é escrita apenas quando existe estado 3D; projetos só 2D
   continuam a ser gravados/abríveis exatamente como antes (v1 incluídos).
+
+## layers.json (v3 — Ronda B: camadas)
+
+Secção opcional da Ronda B. Projetos v1/v2 (sem esta entrada) abrem como
+UMA camada chamada "Base" com os píxeis de `pixels.rgba`.
+
+```json
+{
+  "version": 1,
+  "active": 1,
+  "layers": [
+    {"name": "Base", "visible": 1, "opacity": 100},
+    {"name": "Sobreposição", "visible": 1, "opacity": 60}
+  ]
+}
+```
+
+- A ordem do array é a ORDEM DA PILHA: índice 0 = camada de baixo; o array
+  corresponde 1:1 às entradas `layer-0.rgba` … `layer-(n-1).rgba` do mesmo ZIP
+  (píxeis crus RGBA, igual formato de `pixels.rgba`).
+- `visible` — `0`/`1` (camada excluída da composição quando `0`).
+- `opacity` — 0..100 (alfa RETO escalado na composição source-over; nunca
+  premultiplicado — mesmo contrato do resto do projeto).
+- `active` — índice da camada ativa.
+- Em projetos v3, `pixels.rgba` guarda a COMPOSIÇÃO das camadas visíveis —
+  versões antigas da app (v1/v2) abrem o ficheiro e veem a composição; a app
+  atual reconstrói a pilha completa.
+- Limites: máximo 4 camadas (`OspCodec.MAX_LAYERS`) e máx. 2× MAX_PIXELS
+  somados nas camadas (orçamento de memória de `LayerStack`); entradas
+  `layer-N.rgba` descontínuas ou duplicadas rejeitam o ficheiro com erro
+  controlado.

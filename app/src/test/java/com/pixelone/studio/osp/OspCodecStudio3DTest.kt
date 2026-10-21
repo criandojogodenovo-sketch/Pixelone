@@ -50,7 +50,7 @@ class OspCodecStudio3DTest {
         val out = ByteArrayOutputStream()
         OspCodec.save(manifesto(doc), doc, out, studio3dJsonExemplo)
         val loaded = OspCodec.load(out.toByteArray())
-        assertEquals(2, loaded.manifest.formatVersion)
+        assertEquals(OspCodec.FORMAT_VERSION, loaded.manifest.formatVersion)
         assertEquals(studio3dJsonExemplo, loaded.studio3dJson)
         assertTrue(doc.copyPixels().contentEquals(loaded.document.copyPixels()))
     }
@@ -61,7 +61,7 @@ class OspCodecStudio3DTest {
         val out = ByteArrayOutputStream()
         OspCodec.save(manifesto(doc), doc, out)
         val loaded = OspCodec.load(out.toByteArray())
-        assertEquals(2, loaded.manifest.formatVersion)
+        assertEquals(OspCodec.FORMAT_VERSION, loaded.manifest.formatVersion)
         assertNull(loaded.studio3dJson)
     }
 
@@ -72,7 +72,7 @@ class OspCodecStudio3DTest {
         OspCodec.save(manifesto(doc), doc, out, studio3dJsonExemplo)
         val manifest = OspCodec.readManifest(out.toByteArray())
         assertEquals("projeto-3d", manifest.name)
-        assertEquals(2, manifest.formatVersion)
+        assertEquals(OspCodec.FORMAT_VERSION, manifest.formatVersion)
     }
 
     // ------------------------------------------------------------------
