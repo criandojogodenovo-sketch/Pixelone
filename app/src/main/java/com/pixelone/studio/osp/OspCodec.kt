@@ -13,41 +13,51 @@ import java.util.zip.ZipOutputStream
 /**
  * Formato nativo de projeto do Pixel One: `.osp` (One Sprite Project).
  *
- * ESPECIFICAÇÃO (versão 1 — documentada também em docs/formato-osp.md):
- * - Contentor ZIP com exatamente duas entradas, por esta ordem:
- *     1. manifest.json — metadados (ver [OspManifest])
+ * ESPECIFICAÇÃO (versão 2 — documentada também em docs/formato-osp.md):
+ * - Contentor ZIP com até três entradas, por esta ordem:
+ *     1. manifest.json — metadados (ver [OspManifest]);
  *     2. pixels.rgba   — píxeis RAW em bytes R,G,B,A por píxel, row-major,
  *                        SEM compressão adicional (o ZIP já comprime);
- *                        tamanho obrigatório = width * height * 4.
+ *                        tamanho obrigatório = width * height * 4;
+ *     3. studio3d.json — OPCIONAL (v2): referências do 3D Texture Studio
+ *                        (modelo, associações material→textura, câmara,
+ *                        amostragem) — ver [Studio3DState]. Projetos v1
+ *                        (sem esta entrada) continuam a abrir sem alterações.
  * - SEM PERDAS: os valores ARGB são preservados ao byte, incluindo a
  *   transparência real (alpha 0 = transparente, 255 = opaco).
  *
  * SEGURANÇA E ROBUSTEZ:
- * - O ZIP é lido IN-MEMORY com lista branca de nomes de entrada ("manifest.json"
- *   e "pixels.rgba"); qualquer outra entrada torna o ficheiro inválido — não
- *   existe extração para o sistema de ficheiros, logo path traversal é
- *   impossível por construção.
- * - O tamanho total descomprimido é limitado: manifest ≤ [MAX_MANIFEST_BYTES]
- *   e pixels.rgba tem de medir EXATAMENTE width*height*4 validado a partir do
- *   manifesto lido antes (impede zip bombs e alocações excessivas).
+ * - O ZIP é lido IN-MEMORY com lista branca de nomes de entrada ("manifest.json",
+ *   "pixels.rgba" e "studio3d.json"); qualquer outra entrada torna o ficheiro
+ *   inválido — não existe extração para o sistema de ficheiros, logo path
+ *   traversal é impossível por construção.
+ * - O tamanho total descomprimido é limitado: manifest ≤ [MAX_MANIFEST_BYTES],
+ *   studio3d.json ≤ [MAX_STUDIO3D_BYTES] e pixels.rgba tem de medir EXATAMENTE
+ *   width*height*4 validado a partir do manifesto lido antes (impede zip bombs
+ *   e alocações excessivas).
  * - Número máximo de entradas: [MAX_ENTRIES].
- * - Versões desconhecidas do formato: rejeitadas de forma controlada com
- *   [OspUnsupportedVersionException] (mensagem clara ao utilizador, dados
- *   locais nunca corrompidos).
+ * - Versões desconhecidas do formato (superiores à suportada): rejeitadas de
+ *   forma controlada com [OspUnsupportedVersionException] (mensagem clara ao
+ *   utilizador, dados locais nunca corrompidos). Versões antigas (v1) abrem
+ *   normalmente — compatibilidade para trás garantida pela Fase 3.
  */
 object OspCodec {
 
-    /** Identificador e versão do formato (v1). */
+    /** Identificador e versão do formato (v2 — adiciona studio3d.json opcional). */
     const val FORMAT_ID: String = "pixel-one-osp"
-    const val FORMAT_VERSION: Int = 1
+    const val FORMAT_VERSION: Int = 2
 
     const val ENTRY_MANIFEST: String = "manifest.json"
     const val ENTRY_PIXELS: String = "pixels.rgba"
+    const val ENTRY_STUDIO3D: String = "studio3d.json"
 
     /** Limite de segurança para o manifesto (orçamento: 64 KB). */
     const val MAX_MANIFEST_BYTES: Int = 64 * 1024
 
-    /** Máximo de entradas aceites no ZIP (lista branca tem 2). */
+    /** Limite de segurança para a secção 3D (referências — 64 KB chegam). */
+    const val MAX_STUDIO3D_BYTES: Int = 64 * 1024
+
+    /** Máximo de entradas aceites no ZIP (lista branca tem 3). */
     const val MAX_ENTRIES: Int = 16
 
     /** Ficheiro .osp malformado/inválido (erro controlado, mensagem clara). */
@@ -70,9 +80,15 @@ object OspCodec {
      *
      * @param manifest metadados do projeto (nome, dimensões, timestamps, paleta).
      * @param document documento com os píxeis.
+     * @param studio3dJson conteúdo JSON da secção 3D (opcional, v2); null = não escreve a entrada.
      * @throws IOException em falha de escrita (inclui falta de espaço).
      */
-    fun save(manifest: OspManifest, document: PixelDocument, output: OutputStream) {
+    fun save(
+        manifest: OspManifest,
+        document: PixelDocument,
+        output: OutputStream,
+        studio3dJson: String? = null
+    ) {
         // Validação ANTES de qualquer escrita: nunca deixar um ficheiro a meio.
         manifest.validateFor(document)
 
@@ -95,6 +111,15 @@ object OspCodec {
             zip.putNextEntry(pixelsEntry)
             zip.write(rgba)
             zip.closeEntry()
+
+            if (!studio3dJson.isNullOrBlank()) {
+                val studio3dEntry = ZipEntry(ENTRY_STUDIO3D).apply {
+                    time = manifest.updatedAtEpochMs
+                }
+                zip.putNextEntry(studio3dEntry)
+                zip.write(studio3dJson.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
         } finally {
             zip.finish()
             zip.flush()
@@ -106,7 +131,12 @@ object OspCodec {
     // ------------------------------------------------------------------
 
     /** Resultado da leitura de um .osp. */
-    data class LoadedProject(val manifest: OspManifest, val document: PixelDocument)
+    data class LoadedProject(
+        val manifest: OspManifest,
+        val document: PixelDocument,
+        /** Conteúdo JSON da secção 3D, ou null se o projeto não a tiver (v1). */
+        val studio3dJson: String? = null
+    )
 
     /**
      * Lê um projeto .osp de [input] (não fecha o stream).
@@ -119,6 +149,7 @@ object OspCodec {
 
         var manifestJson: ByteArray? = null
         var pixelsRgba: ByteArray? = null
+        var studio3dJson: ByteArray? = null
         var entries = 0
 
         while (true) {
@@ -132,7 +163,8 @@ object OspCodec {
                 throw OspInvalidException("ZIP com entradas a mais (${MAX_ENTRIES} máximo)")
             }
             val name = entry.name
-            // Lista branca estrita: apenas as duas entradas conhecidas.
+            // Lista branca estrita: apenas as três entradas conhecidas (a 3.ª é
+            // opcional e só existe em projetos v2).
             when (name) {
                 ENTRY_MANIFEST -> {
                     if (manifestJson != null) throw OspInvalidException("Entrada duplicada: $name")
@@ -143,6 +175,10 @@ object OspCodec {
                     // Lê com um teto de segurança alto (o limite real vem do manifesto);
                     // pior caso permitido: 2048*2048*4 = 16 MB.
                     pixelsRgba = readExactly(zip, PixelDocument.MAX_PIXELS * 4, name)
+                }
+                ENTRY_STUDIO3D -> {
+                    if (studio3dJson != null) throw OspInvalidException("Entrada duplicada: $name")
+                    studio3dJson = readExactly(zip, MAX_STUDIO3D_BYTES, name)
                 }
                 else -> throw OspInvalidException("Entrada inesperada no ZIP: '$name'")
             }
@@ -159,11 +195,10 @@ object OspCodec {
         if (manifest.formatVersion > FORMAT_VERSION) {
             throw OspUnsupportedVersionException(manifest.formatVersion)
         }
-        if (manifest.formatVersion < FORMAT_VERSION) {
-            throw OspInvalidException(
-                "Formato .osp versão ${manifest.formatVersion} é mais antiga que a suportada " +
-                    "($FORMAT_VERSION); ficheiro possivelmente corrupto."
-            )
+        // formatVersion 1 (Fases 0-2, sem secção 3D) e 2 (Fase 3+) são ambas
+        // aceites — compatibilidade com projetos antigos garantida.
+        if (manifest.formatVersion < 1) {
+            throw OspInvalidException("formatVersion inválida: ${manifest.formatVersion}")
         }
 
         val expected = manifest.width.toLong() * manifest.height.toLong() * 4L
@@ -179,7 +214,8 @@ object OspCodec {
         } catch (e: IllegalArgumentException) {
             throw OspInvalidException("Dados de píxeis inválidos: ${e.message}", e)
         }
-        return LoadedProject(manifest, document)
+        val studio3dText = studio3dJson?.toString(Charsets.UTF_8)
+        return LoadedProject(manifest, document, studio3dText)
     }
 
     /** Lê um .osp de um ByteArray (utilitário para testes e uso em memória). */

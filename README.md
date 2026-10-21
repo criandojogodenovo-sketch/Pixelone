@@ -9,7 +9,37 @@ de texturas a modelos 3D, com construção geométrica assistida 2D-para-3D.
 - **Modelo:** mobile-first, offline nas funções centrais, sem backend, contas, anúncios ou pagamentos
 - **Nota de rebranding:** todas as referências anteriores a "One Sprite Studio" passam a designar-se **Pixel One**
 
-## Estado do projeto — Correções de performance, canvas e UX (0.3.0)
+## Estado do projeto — Fase 3: 3D Texture Studio (0.4.0)
+
+Implementado na Fase 3 (branch `feature/fase-3-3d-texture-studio`):
+
+- **Visualizador 3D real (OpenGL ES)**: GLSurfaceView com contexto ES 3.0,
+  shaders próprios, câmara orbital (1 dedo roda; 2 dedos zoom e
+  deslocamento; botão "Repor câmara"); geometria de demonstração (cubo
+  texturizado + chão) visível logo ao abrir.
+- **Importação glTF 2.0/GLB** com validação explícita (versão, extensões
+  obrigatórias, buffers externos, accessors, limites: 64 MB / 300k
+  triângulos / texturas ≤ 4096²) e mensagens claras e recuperáveis.
+- **Aplicação de texturas por UV**: a textura do Texture Studio (pixels do
+  próprio projeto) é aplicada aos materiais; associação por material
+  (Documento / Embutida / Sem textura); alfa reto preservado; amostragem
+  Nearest (padrão) ou Linear (opcional).
+- **Vista UV**: linhas UV finas semitransparentes sobre a textura (com
+  interruptor), seleção de ilha por toque com realce NA VISTA e NO MODELO
+  3D, seleção de malha/material, botão "Pintar esta textura".
+- **Modo Dividido**: 3D em cima e pintura em baixo, com atualização PARCIAL
+  da GPU (`glTexSubImage2D` só da região suja — nunca a textura inteira por
+  traço); mesmo motor 2D (PixelDocument + histórico esparso) na pintura.
+- **`.osp` v2**: secção opcional `studio3d.json` com REFERÊNCIAS (modelo,
+  bindings material→textura, câmara, amostragem); projetos v1 abrem intactos.
+- Modelos sem UV: modos UV/Dividido bloqueados com explicação; 3D funcional.
+- 212 testes unitários (71 novos: parser GLB construído byte a byte nos
+  testes, ilhas UV, câmara/matizes, dirty rects, RGBA, .osp v2/v1, demo).
+
+Ainda **não** implementado: reembutir o modelo no .osp (referência apenas),
+UV overlay dentro do editor 2D, animação/skinning, iluminação.
+
+## Estado anterior — Correções de performance, canvas e UX (0.3.0)
 
 Correções implementadas nesta fase (sobre as Fases 1+2), em
 `fix/texture-studio-performance`:
@@ -65,6 +95,7 @@ construção 2D-para-3D, camadas, seleção/recorte.
 - `docs/spritesheet-atlas-json.md` — esquemas JSON dos metadados de exportação.
 - `docs/relatorio-fase-1-2.md` — relatório A–K das Fases 1+2.
 - `docs/relatorio-correcoes-performance.md` — relatório A–J desta correção.
+- `docs/relatorio-fase-3.md` — relatório da Fase 3 (3D Texture Studio).
 
 ## Estado anterior — Fases 1+2 (editor de pixel art, persistência e exportação)
 
@@ -127,8 +158,8 @@ Ainda **não** implementado (planeado): editor de pixel art, renderer 3D/OpenGL 
 
 1. **Texture Studio** — **editor de pixel art funcional** (Fases 1+2): desenho,
    histórico, projetos `.osp`, exportação PNG, spritesheets e atlas.
-2. **3D Texture Studio** — aplicação de texturas a modelos 3D através de UVs
-   (planeado; o ecrã indica-o explicitamente).
+2. **3D Texture Studio** — **funcional (Fase 3)**: visualizador OpenGL ES,
+   importação glTF/GLB, texturas por UV, vista UV, pintura em modo Dividido.
 3. **2D-to-3D Studio** — construção geométrica assistida por desenhos e
    referências ortográficas (planeado; o ecrã indica-o explicitamente).
 
@@ -138,8 +169,8 @@ Ainda **não** implementado (planeado): editor de pixel art, renderer 3D/OpenGL 
 | --- | --- | --- |
 | UI | Jetpack Compose | Projeto novo, UI declarativa oficial do Google, adaptação natural a mobile-first. Não se mistura com Android Views. |
 | minSdk / targetSdk | 26 / 35 | minSdk 26 cobre a grande maioria dos telemóveis ativos, permite ícones adaptativos sem PNGs legados e prepara OpenGL ES 3.0. |
-| OpenGL ES | Fase futura | Reservado para a visualização 3D; nada de OpenGL nesta fase. |
-| C++ / JNI | Só com vantagem demonstrável | Nenhum JNI nas Fases 0–2. |
+| OpenGL ES | GLSurfaceView (ES 3.0) desde a Fase 3 | Shaders próprios, sem motor externo; JNI 3D rejeitado (gargalo é a GPU). |
+| C++ / JNI | Só com vantagem demonstrável | Motor 2D (traço/balde) desde 0.3.0; pintura do modo Dividido reutiliza-o. |
 | Motor 2D | Kotlin puro (IntArray ARGB) | Testável em JVM sem dispositivo; separado do Bitmap/renderização. |
 | Mistura de cor | Substituição direta do píxel (sem blending alfa) | Padrão de editores de pixel art; cores exatas e previsíveis. |
 | Ícones | Vetoriais próprios (`PixelIcons`) | Evita material-icons-extended (~30 MB) com a minificação desligada. |
@@ -168,7 +199,7 @@ Pré-requisitos: JDK 17 e Android SDK (API 35 + build-tools) — ou simplesmente
 # Build de debug
 ./gradlew :app:assembleDebug
 
-# Testes unitários (78 testes: motor, histórico, .osp, exportação, PNG)
+# Testes unitários (212 testes: motor, histórico, .osp v2, exportação, PNG, 3D)
 ./gradlew :app:testDebugUnitTest
 
 # Instalar num dispositivo/emulador ligado (opcional)
@@ -265,7 +296,8 @@ docs/relatorio-fase-1-2.md   # relatório das Fases 1+2
 - Sem camadas, seleção/recorte, importação de referências ou animação no editor.
 - O "Guardar como" via SAF escreve uma cópia; se a escrita falhar a meio,
   o destino pode ficar parcial (o projeto interno permanece intacto).
-- 3D e conversão 2D-para-3D não existem ainda; os ecrãs indicam-no explicitamente.
+- O modelo importado não é reembutido no `.osp` (referência + reimportação);
+  sem validação em dispositivo físico (mesma nota das fases anteriores).
 - Instalação em dispositivo físico requer autorização de fontes desconhecidas (sideload).
 
 ## Próximas fases (indicativo)

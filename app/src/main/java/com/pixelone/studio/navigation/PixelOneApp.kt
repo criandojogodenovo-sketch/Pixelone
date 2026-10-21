@@ -43,7 +43,17 @@ fun PixelOneApp() {
             TextureStudioScreen(onBack = { navController.navigateUp() })
         }
         composable(Routes.TEXTURE_3D_STUDIO) {
-            Texture3DStudioScreen(onBack = { navController.navigateUp() })
+            Texture3DStudioScreen(
+                onBack = { navController.navigateUp() },
+                onOpenTextureStudio = {
+                    navController.navigate(Routes.TEXTURE_STUDIO) {
+                        // O 3D fica na pilha — o retorno do Texture Studio
+                        // volta ao 3D com a textura atualizada (bus).
+                        launchSingleTop = true
+                    }
+                },
+                onOpen2Dto3D = { navController.navigate(Routes.STUDIO_2D_TO_3D) }
+            )
         }
         composable(Routes.STUDIO_2D_TO_3D) {
             Studio2Dto3DScreen(onBack = { navController.navigateUp() })

@@ -75,8 +75,9 @@ fun HomeScreen(
                 Spacer(modifier = Modifier.height(12.dp))
                 WorkspaceCard(
                     title = "3D Texture Studio",
-                    subtitle = "Aplicação de texturas a modelos 3D através de UVs.",
-                    status = "PLANEADO",
+                    subtitle = "Visualizador OpenGL ES, importação glTF/GLB e texturas por UV.",
+                    status = "FASE 3 - DISPONÍVEL",
+                    statusHighlight = true,
                     onClick = onOpenTexture3DStudio
                 )
                 Spacer(modifier = Modifier.height(12.dp))
