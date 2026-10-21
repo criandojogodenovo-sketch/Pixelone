@@ -13,8 +13,8 @@ import java.util.zip.ZipOutputStream
 /**
  * Formato nativo de projeto do Pixel One: `.osp` (One Sprite Project).
  *
- * ESPECIFICAÇÃO (versão 2 — documentada também em docs/formato-osp.md):
- * - Contentor ZIP com até três entradas, por esta ordem:
+ * ESPECIFICAÇÃO (versão 3 — Ronda B: CAMADAS; documentada em docs/formato-osp.md):
+ * - Contentor ZIP com entradas, por esta ordem:
  *     1. manifest.json — metadados (ver [OspManifest]);
  *     2. pixels.rgba   — píxeis RAW em bytes R,G,B,A por píxel, row-major,
  *                        SEM compressão adicional (o ZIP já comprime);
@@ -23,6 +23,14 @@ import java.util.zip.ZipOutputStream
  *                        (modelo, associações material→textura, câmara,
  *                        amostragem) — ver [Studio3DState]. Projetos v1
  *                        (sem esta entrada) continuam a abrir sem alterações.
+ *     4. layers.json   — OPCIONAL (v3, Ronda B): lista de camadas (nome,
+ *                        visibilidade, opacidade, ordem) — ver [LayersCodec].
+ *     5. layer-N.rgba  — OPCIONAIS (v3): píxeis crus de cada camada (NA ORDEM
+ *                        da pilha, de baixo para cima, N = 0..MAX_LAYERS-1).
+ *                        Em projetos v3, pixels.rgba guarda a COMPOSIÇÃO das
+ *                        camadas visíveis — versões antigas da app (v1/v2)
+ *                        continuam a abrir o ficheiro v3 e veem a composição.
+ * - Projetos v1/v2 (sem layers.json) abrem como UMA camada (regra da Ronda B).
  * - SEM PERDAS: os valores ARGB são preservados ao byte, incluindo a
  *   transparência real (alpha 0 = transparente, 255 = opaco).
  *
@@ -43,13 +51,25 @@ import java.util.zip.ZipOutputStream
  */
 object OspCodec {
 
-    /** Identificador e versão do formato (v2 — adiciona studio3d.json opcional). */
+    /** Identificador e versão do formato (v3 — Ronda B: camadas). */
     const val FORMAT_ID: String = "pixel-one-osp"
-    const val FORMAT_VERSION: Int = 2
+    const val FORMAT_VERSION: Int = 3
 
     const val ENTRY_MANIFEST: String = "manifest.json"
     const val ENTRY_PIXELS: String = "pixels.rgba"
     const val ENTRY_STUDIO3D: String = "studio3d.json"
+    const val ENTRY_LAYERS: String = "layers.json"
+
+    /** Nome da entrada de píxeis da camada N (ordem da pilha, baixo→topo). */
+    fun layerEntryName(index: Int): String = "layer-$index.rgba"
+
+    /** Reconhece uma entrada layer-N.rgba e devolve N (null se não for). */
+    fun parseLayerEntryName(name: String): Int? {
+        if (!name.startsWith("layer-") || !name.endsWith(".rgba")) return null
+        val middle = name.removePrefix("layer-").removeSuffix(".rgba")
+        val n = middle.toIntOrNull() ?: return null
+        return if (n in 0 until MAX_LAYERS) n else null
+    }
 
     /** Limite de segurança para o manifesto (orçamento: 64 KB). */
     const val MAX_MANIFEST_BYTES: Int = 64 * 1024
@@ -57,7 +77,13 @@ object OspCodec {
     /** Limite de segurança para a secção 3D (referências — 64 KB chegam). */
     const val MAX_STUDIO3D_BYTES: Int = 64 * 1024
 
-    /** Máximo de entradas aceites no ZIP (lista branca tem 3). */
+    /** Limite de segurança para layers.json (4 camadas com metadados — 16 KB chegam). */
+    const val MAX_LAYERS_BYTES: Int = 16 * 1024
+
+    /** Máximo de camadas por projeto (igual a [com.pixelone.studio.pixel.LayerStack.MAX_LAYERS]). */
+    const val MAX_LAYERS: Int = 4
+
+    /** Máximo de entradas aceites no ZIP (lista branca: 3 base + 1 layers + 4 camadas). */
     const val MAX_ENTRIES: Int = 16
 
     /** Ficheiro .osp malformado/inválido (erro controlado, mensagem clara). */
@@ -75,22 +101,45 @@ object OspCodec {
     // Escrita
     // ------------------------------------------------------------------
 
+    /** Secção de camadas a guardar (v3). */
+    data class LayersSection(
+        /** Conteúdo JSON de layers.json (ver [LayersCodec]). */
+        val json: String,
+        /** Píxeis RGBA de cada camada, NA ORDEM da pilha (baixo→topo). */
+        val layerPixels: List<ByteArray>
+    )
+
     /**
      * Escreve o projeto como .osp em [output]. O stream é fechado pelo chamador.
      *
      * @param manifest metadados do projeto (nome, dimensões, timestamps, paleta).
-     * @param document documento com os píxeis.
+     * @param document documento com os píxeis (a COMPOSIÇÃO quando há camadas).
      * @param studio3dJson conteúdo JSON da secção 3D (opcional, v2); null = não escreve a entrada.
+     * @param layers secção de camadas (opcional, v3); null = projeto sem camadas
+     *        (v1/v2 — abre como 1 camada).
      * @throws IOException em falha de escrita (inclui falta de espaço).
      */
     fun save(
         manifest: OspManifest,
         document: PixelDocument,
         output: OutputStream,
-        studio3dJson: String? = null
+        studio3dJson: String? = null,
+        layers: LayersSection? = null
     ) {
         // Validação ANTES de qualquer escrita: nunca deixar um ficheiro a meio.
         manifest.validateFor(document)
+        layers?.let { l ->
+            require(l.layerPixels.isNotEmpty()) { "Secção de camadas vazia" }
+            require(l.layerPixels.size <= MAX_LAYERS) {
+                "Demasiadas camadas (${l.layerPixels.size} > $MAX_LAYERS)"
+            }
+            val expected = document.width.toLong() * document.height.toLong() * 4L
+            l.layerPixels.forEachIndexed { i, px ->
+                require(px.size.toLong() == expected) {
+                    "Píxeis da camada $i têm ${px.size} bytes; esperado $expected"
+                }
+            }
+        }
 
         val json = MiniJson.write(manifest.toJson())
         val rgba = document.toRgbaBytes()
@@ -120,6 +169,23 @@ object OspCodec {
                 zip.write(studio3dJson.toByteArray(Charsets.UTF_8))
                 zip.closeEntry()
             }
+            if (layers != null) {
+                val layersEntry = ZipEntry(ENTRY_LAYERS).apply {
+                    time = manifest.updatedAtEpochMs
+                }
+                zip.putNextEntry(layersEntry)
+                zip.write(layers.json.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+                layers.layerPixels.forEachIndexed { i, px ->
+                    val entry = ZipEntry(layerEntryName(i)).apply {
+                        time = manifest.updatedAtEpochMs
+                        size = px.size.toLong()
+                    }
+                    zip.putNextEntry(entry)
+                    zip.write(px)
+                    zip.closeEntry()
+                }
+            }
         } finally {
             zip.finish()
             zip.flush()
@@ -135,7 +201,9 @@ object OspCodec {
         val manifest: OspManifest,
         val document: PixelDocument,
         /** Conteúdo JSON da secção 3D, ou null se o projeto não a tiver (v1). */
-        val studio3dJson: String? = null
+        val studio3dJson: String? = null,
+        /** Secção de camadas (v3), ou null em projetos v1/v2 (1 camada). */
+        val layers: LayersSection? = null
     )
 
     /**
@@ -150,6 +218,8 @@ object OspCodec {
         var manifestJson: ByteArray? = null
         var pixelsRgba: ByteArray? = null
         var studio3dJson: ByteArray? = null
+        var layersJson: ByteArray? = null
+        val layerPixels = HashMap<Int, ByteArray>()
         var entries = 0
 
         while (true) {
@@ -180,7 +250,23 @@ object OspCodec {
                     if (studio3dJson != null) throw OspInvalidException("Entrada duplicada: $name")
                     studio3dJson = readExactly(zip, MAX_STUDIO3D_BYTES, name)
                 }
-                else -> throw OspInvalidException("Entrada inesperada no ZIP: '$name'")
+                ENTRY_LAYERS -> {
+                    if (layersJson != null) throw OspInvalidException("Entrada duplicada: $name")
+                    layersJson = readExactly(zip, MAX_LAYERS_BYTES, name)
+                }
+                else -> {
+                    // layer-N.rgba (v3) — reconhecido por padrão; duplicados rejeitados.
+                    val layerIndex = parseLayerEntryName(name)
+                    if (layerIndex != null) {
+                        if (layerPixels.containsKey(layerIndex)) {
+                            throw OspInvalidException("Entrada duplicada: $name")
+                        }
+                        layerPixels[layerIndex] =
+                            readExactly(zip, PixelDocument.MAX_PIXELS * 4, name)
+                    } else {
+                        throw OspInvalidException("Entrada inesperada no ZIP: '$name'")
+                    }
+                }
             }
             zip.closeEntry()
         }
@@ -215,7 +301,29 @@ object OspCodec {
             throw OspInvalidException("Dados de píxeis inválidos: ${e.message}", e)
         }
         val studio3dText = studio3dJson?.toString(Charsets.UTF_8)
-        return LoadedProject(manifest, document, studio3dText)
+
+        // Camadas (v3): layers.json tem de ser coerente com as entradas
+        // layer-N.rgba — índices contíguos 0..k-1, sem buracos. Projetos v1/v2
+        // (sem layers.json) devolvem null → abrem como UMA camada.
+        val layersSection: LayersSection? = if (layersJson != null) {
+            val expectedLayers = layerPixels.size
+            if (expectedLayers == 0) {
+                throw OspInvalidException("layers.json presente sem entradas layer-N.rgba")
+            }
+            for (i in 0 until expectedLayers) {
+                if (!layerPixels.containsKey(i)) {
+                    throw OspInvalidException("Camada $i em falta (entradas descontínuas)")
+                }
+            }
+            LayersSection(layersJson.toString(Charsets.UTF_8),
+                (0 until expectedLayers).map { layerPixels.getValue(it) })
+        } else {
+            if (layerPixels.isNotEmpty()) {
+                throw OspInvalidException("Entradas layer-N.rgba sem layers.json")
+            }
+            null
+        }
+        return LoadedProject(manifest, document, studio3dText, layersSection)
     }
 
     /** Lê um .osp de um ByteArray (utilitário para testes e uso em memória). */
