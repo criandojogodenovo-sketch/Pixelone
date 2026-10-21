@@ -30,6 +30,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -56,17 +57,23 @@ import com.pixelone.studio.ui.theme.PixelSurface
 import com.pixelone.studio.ui.theme.PixelSurfaceElevated
 
 /**
- * Modo UV: textura com sobreposição UV, seleção de ilha por toque,
- * escolha de malha/material e botão "Pintar esta textura".
+ * Modo UV: textura com sobreposição UV, seleção de ilha por TOQUE (curto,
+ * sem arrastar), escolha de malha/material e botão "Pintar esta textura".
  * Modelos sem UV nunca chegam aqui (o seletor bloqueia — ver [ModeSelector]).
+ *
+ * CORREÇÕES RONDA A (G): NENHUM overlay sobre a textura — o interruptor
+ * "Linhas UV" existe UMA VEZ (painel inferior) e a informação da ilha +
+ * botões "Focar"/"Limpar seleção" ficam no painel, nunca por cima da vista.
  */
 @Composable
-internal fun UvMode(viewModel: Studio3DViewModel) {
-    Box(Modifier.fillMaxWidth().fillMaxHeight(0.58f)) {
+internal fun UvMode(
+    viewModel: Studio3DViewModel,
+    uvViewHost: androidx.compose.runtime.MutableState<TexturePaintView?>
+) {
+    Box(Modifier.fillMaxWidth().fillMaxHeight()) {
         val showUv by viewModel.showUvOverlay.observeAsLocalState()
         val selectedMesh by viewModel.selectedMesh.observeAsLocalState()
         val bmp by viewModel.presentationBitmap.observeAsLocalState()
-        var paintView by remember { mutableStateOf<TexturePaintView?>(null) }
         val islands by viewModel.selectedIsland.observeAsLocalState()
         val paintVersion by viewModel.paintVersion.observeAsLocalState()
 
@@ -75,80 +82,51 @@ internal fun UvMode(viewModel: Studio3DViewModel) {
                 TexturePaintView(ctx).apply {
                     surfaceMode = TexturePaintView.SurfaceMode.UV_SELECT
                     onUvTap = { u, v -> viewModel.selectIslandAt(u, v) }
-                    paintView = this
+                    uvViewHost.value = this
                 }
             },
             update = { view ->
                 view.textureBitmap = bmp
                 view.uvSegments = if (showUv) viewModel.uvWireframeSegments(selectedMesh) else null
                 view.islandHighlightSegments = viewModel.islandHighlightSegments()
+                view.islandUvBounds = viewModel.selectedIslandUvBounds()
                 view.invalidate()
             }
         )
 
         // Redesenho ao vivo durante a pintura/undo (região suja já aplicada).
         LaunchedEffect(paintVersion) {
-            paintView?.invalidate()
+            uvViewHost.value?.invalidate()
         }
 
-        // Interruptor UV (requisito) — overlay discreto no topo.
-        Surface(
-            color = PixelSurfaceElevated.copy(alpha = 0.9f),
-            shape = MaterialTheme.shapes.small,
-            modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Linhas UV", style = MaterialTheme.typography.labelMedium, color = PixelGrayLight)
-                Spacer(Modifier.width(6.dp))
-                Switch(
-                    checked = showUv,
-                    onCheckedChange = { viewModel.setShowUv(it) },
-                    modifier = Modifier.size(40.dp)
-                )
-            }
+        // Realce da ilha: reage também a mudanças de seleção.
+        LaunchedEffect(islands) {
+            uvViewHost.value?.invalidate()
         }
 
-        if (islands != null) {
-            Surface(
-                color = PixelSurfaceElevated.copy(alpha = 0.9f),
-                shape = MaterialTheme.shapes.small,
-                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)
-            ) {
-                Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "Ilha #${islands!!.island.id} (${islands!!.island.triangleCount} tri.)",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = PixelOrange
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        "limpar",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = PixelGray,
-                        modifier = Modifier.clickable { viewModel.clearIslandSelection() }
-                    )
-                }
-            }
+        DisposableEffect(Unit) {
+            onDispose { uvViewHost.value = null }
         }
     }
 }
 
 /**
- * Modo Dividido: 3D em cima (só visualização) e textura/UV em baixo (onde se
- * pinta). O 3D atualiza AO VIVO durante a pintura — com ATUALIZAÇÃO PARCIAL
- * da GPU (glTexSubImage2D da região suja, via [Studio3DViewModel.markDirty]).
+ * Modo Dividido: 3D em cima e textura/UV em baixo (onde se pinta), CADA UM
+ * com metade da área principal (≈40% do ecrã em telemóveis típicos — requisito
+ * J da Ronda A). O 3D atualiza AO VIVO durante a pintura — com ATUALIZAÇÃO
+ * PARCIAL da GPU (glTexSubImage2D da região suja, via [Studio3DViewModel.markDirty]).
+ * A SELEÇÃO aparece nos DOIS painéis em simultâneo (requisito da Ronda A).
  */
 @Composable
 internal fun SplitMode(viewModel: Studio3DViewModel) {
-    Column(Modifier.fillMaxWidth().fillMaxHeight(0.58f)) {
-        // 3D em cima (~metade da área principal) — sem faixa de materiais.
+    Column(Modifier.fillMaxWidth().fillMaxHeight()) {
+        // 3D em cima (metade da área principal) — toque seleciona a face/ilha.
         Studio3DGlViewport(viewModel, Modifier.fillMaxWidth().weight(1f))
-        // Superfície de pintura em baixo.
+        // Superfície de pintura em baixo — mostra a mesma seleção (ilhas).
         val bmp by viewModel.presentationBitmap.observeAsLocalState()
         val paintVersion by viewModel.paintVersion.observeAsLocalState()
+        val showUv by viewModel.showUvOverlay.observeAsLocalState()
+        val islands by viewModel.selectedIsland.observeAsLocalState()
         var paintView by remember { mutableStateOf<TexturePaintView?>(null) }
         AndroidView(
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -163,12 +141,15 @@ internal fun SplitMode(viewModel: Studio3DViewModel) {
             },
             update = { view ->
                 view.textureBitmap = bmp
-                view.uvSegments = viewModel.uvWireframeSegments()
+                // RONDA A (F): o modo Dividido RESPEITA o interruptor "Linhas UV".
+                view.uvSegments = if (showUv) viewModel.uvWireframeSegments() else null
+                view.islandHighlightSegments = viewModel.islandHighlightSegments()
                 view.invalidate()
             }
         )
-        // Redesenho ao vivo durante a pintura (o 3D já recebeu a região suja).
-        LaunchedEffect(paintVersion) {
+        // Redesenho ao vivo durante a pintura (o 3D já recebeu a região suja)
+        // e quando a seleção muda (aparece nos dois painéis em simultâneo).
+        LaunchedEffect(paintVersion, islands) {
             paintView?.invalidate()
         }
     }
@@ -184,39 +165,33 @@ internal fun BottomPanel(
     mode: StudioMode,
     expanded: Boolean,
     onToggle: () -> Unit,
-    onPaintTexture: () -> Unit
+    onPaintTexture: () -> Unit,
+    uvViewHost: androidx.compose.runtime.MutableState<TexturePaintView?>
 ) {
     Surface(color = PixelSurface, tonalElevation = 4.dp) {
         Column(Modifier.fillMaxWidth()) {
+            // RONDA A (I): o texto de depuração "Painel — Textura | Amostragem
+            // | Info" foi removido. A linha de recolha mantém só a seta.
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(36.dp)
+                    .height(28.dp)
                     .clickable { onToggle() }
                     .padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
             ) {
-                Text(
-                    text = when (mode) {
-                        StudioMode.THREE_D -> "Painel — Textura | Amostragem | Info"
-                        StudioMode.UV -> "Painel — UV e materiais"
-                        StudioMode.SPLIT -> "Painel — Cor, pincel, desfazer"
-                    },
-                    style = MaterialTheme.typography.labelMedium,
-                    color = PixelOrange
-                )
-                Spacer(Modifier.weight(1f))
                 Text(
                     if (expanded) "▾" else "▸",
                     color = PixelGray,
-                    style = MaterialTheme.typography.titleMedium
+                    style = MaterialTheme.typography.titleSmall
                 )
             }
             if (expanded) {
-                Box(Modifier.height(140.dp)) {
+                Box(Modifier.height(150.dp)) {
                     when (mode) {
                         StudioMode.THREE_D -> Panel3D(viewModel, onPaintTexture)
-                        StudioMode.UV -> PanelUv(viewModel, onPaintTexture)
+                        StudioMode.UV -> PanelUv(viewModel, onPaintTexture, uvViewHost)
                         StudioMode.SPLIT -> PanelSplit(viewModel)
                     }
                 }
@@ -230,8 +205,14 @@ internal fun BottomPanel(
 @Composable
 private fun Panel3D(viewModel: Studio3DViewModel, onPaintTexture: () -> Unit) {
     var tab by remember { mutableIntStateOf(0) }
-    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 4.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    // RONDA A (I): rolagem vertical — nenhum texto fica cortado em ecrãs baixos.
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("Textura", "Amostragem", "Info").forEachIndexed { index, label ->
                 Text(
                     label,
@@ -266,7 +247,9 @@ private fun Panel3DTexture(viewModel: Studio3DViewModel, onPaintTexture: () -> U
             color = PixelGrayLight
         )
         Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // RONDA A (I): chips com rolagem horizontal — "Textura do projeto"
+        // nunca fica cortado em ecrãs estreitos.
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             BindingChip("Textura do projeto", TextureRef.DOCUMENT, bindings, selectedMaterial, viewModel)
             BindingChip("Embutida", TextureRef.EMBEDDED, bindings, selectedMaterial, viewModel)
             BindingChip("Sem textura", TextureRef.NONE, bindings, selectedMaterial, viewModel)
@@ -334,9 +317,9 @@ private fun Panel3DSampling(viewModel: Studio3DViewModel) {
             )
         }
         Spacer(Modifier.height(6.dp))
+        // RONDA A (I): descrição curta — não corta no painel de 150 dp.
         Text(
-            "Nearest Neighbor mantém cada píxel como um bloco nítido; " +
-                "Linear interpola (opcional para modelos fotográficos).",
+            "Nearest: nítida (pixel art) · Linear: suave",
             style = MaterialTheme.typography.labelSmall,
             color = PixelGray
         )
@@ -373,14 +356,75 @@ private fun InfoLine(label: String, value: String) {
     }
 }
 
-// ------------------------------ Modo UV: interruptor + malha + material ------
+// ------------------------------ Modo UV: seleção + interruptor + malha -------
 
+/**
+ * RONDA A (G + nova funcionalidade): UMA linha de seleção com etiqueta da
+ * ilha, "Focar" (zoom automático com grelha de píxeis) e "Limpar seleção",
+ * todos com alvo ≥ 48 dp — nada sobrepõe a textura.
+ */
 @Composable
-private fun PanelUv(viewModel: Studio3DViewModel, onPaintTexture: () -> Unit) {
+private fun PanelUv(
+    viewModel: Studio3DViewModel,
+    onPaintTexture: () -> Unit,
+    uvViewHost: androidx.compose.runtime.MutableState<TexturePaintView?>
+) {
     val showUv by viewModel.showUvOverlay.observeAsLocalState()
     val selectedMesh by viewModel.selectedMesh.observeAsLocalState()
-    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 4.dp)) {
+    val selection by viewModel.selectedIsland.observeAsLocalState()
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = if (selection != null) {
+                    "Ilha #${selection!!.island.id} (${selection!!.island.triangleCount} tri.)"
+                } else {
+                    "Toque numa face ou ilha"
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = if (selection != null) PixelOrange else PixelGray,
+                modifier = Modifier.weight(1f)
+            )
+            // Botão "Focar": zoom automático à ilha com grelha de píxeis.
+            Box(
+                modifier = Modifier
+                    .size(width = 64.dp, height = 48.dp)
+                    .background(if (selection != null) PixelSurfaceElevated else Color.Transparent)
+                    .border(
+                        1.dp,
+                        if (selection != null) PixelOrange else PixelGrayBorder,
+                        MaterialTheme.shapes.small
+                    )
+                    .clickable(enabled = selection != null) {
+                        val bounds = viewModel.selectedIslandUvBounds()
+                        if (bounds != null) {
+                            uvViewHost.value?.focusOnIsland(bounds[0], bounds[1], bounds[2], bounds[3])
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("Focar", style = MaterialTheme.typography.labelMedium, color = PixelOrange)
+            }
+            Spacer(Modifier.width(6.dp))
+            // Botão "Limpar seleção" (requisito da Ronda A).
+            Box(
+                modifier = Modifier
+                    .size(width = 76.dp, height = 48.dp)
+                    .background(if (selection != null) PixelSurfaceElevated else Color.Transparent)
+                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
+                    .clickable(enabled = selection != null) { viewModel.clearIslandSelection() },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("Limpar", style = MaterialTheme.typography.labelMedium, color = PixelGrayLight)
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Interruptor ÚNICO de linhas UV (requisito G) — no painel inferior.
             Text("Linhas UV", style = MaterialTheme.typography.labelMedium, color = PixelGrayLight)
             Spacer(Modifier.width(6.dp))
             Switch(checked = showUv, onCheckedChange = { viewModel.setShowUv(it) }, modifier = Modifier.size(40.dp))
@@ -443,13 +487,21 @@ private fun PanelSplit(viewModel: Studio3DViewModel) {
     var brush by remember { mutableIntStateOf(viewModel.paintBrushSize) }
     var erasing by remember { mutableStateOf(viewModel.eraseMode) }
     var color by remember { mutableIntStateOf(viewModel.paintColor) }
+    val showUv by viewModel.showUvOverlay.observeAsLocalState()
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 4.dp)) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        // RONDA A (J): Desfazer/Refazer/Balde numa fila FIXA — SEMPRE visíveis,
+        // nunca empurrados para fora do ecrã pela fila rolável de pincéis.
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             // Cor atual (abre o seletor).
             Box(
                 Modifier
-                    .size(36.dp)
+                    .size(48.dp)
                     .background(Color(color))
                     .border(2.dp, if (erasing) PixelGrayBorder else PixelOrange, MaterialTheme.shapes.small)
                     .clickable { showColorPicker = true }
@@ -465,14 +517,56 @@ private fun PanelSplit(viewModel: Studio3DViewModel) {
                         viewModel.paintColor = if (erasing) 0x00000000 else color
                     }
                     .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .padding(horizontal = 10.dp, vertical = 12.dp)
             )
-            // Tamanhos de pincel 1..8.
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Spacer(Modifier.weight(1f))
+            // Desfazer / refazer — alvos de 48 dp, fora de qualquer rolagem.
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(PixelSurfaceElevated)
+                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
+                    .clickable { viewModel.undo() },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("↶", style = MaterialTheme.typography.titleLarge, color = PixelGrayLight)
+            }
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(PixelSurfaceElevated)
+                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
+                    .clickable { viewModel.redo() },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("↷", style = MaterialTheme.typography.titleLarge, color = PixelGrayLight)
+            }
+            // Balde: aplica no próximo toque (define modo fill pendente).
+            Icon(
+                PixelIcons.fill(),
+                contentDescription = "Balde no próximo toque",
+                tint = PixelOrange,
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(
+                        if (viewModel.pendingFill) PixelOrange.copy(alpha = 0.25f) else PixelSurfaceElevated
+                    )
+                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
+                    .clickable { viewModel.pendingFill = !viewModel.pendingFill }
+                    .padding(12.dp)
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        // Fila rolável de pincéis + interruptor de linhas UV (afeta a área de
+        // baixo; estado partilhado com os outros modos — um só interruptor).
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Pincel", style = MaterialTheme.typography.labelSmall, color = PixelGray)
+            Spacer(Modifier.width(6.dp))
+            Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 (1..8).forEach { size ->
                     Box(
                         Modifier
-                            .size(32.dp)
+                            .size(48.dp)
                             .background(if (brush == size) PixelOrange else PixelSurfaceElevated)
                             .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
                             .clickable {
@@ -489,49 +583,15 @@ private fun PanelSplit(viewModel: Studio3DViewModel) {
                     }
                 }
             }
-            Spacer(Modifier.weight(1f))
-            // Desfazer / refazer — alvos de 48 dp.
-            Text(
-                "↶",
-                style = MaterialTheme.typography.titleLarge,
-                color = PixelGrayLight,
-                modifier = Modifier
-                    .size(48.dp)
-                    .background(PixelSurfaceElevated)
-                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
-                    .clickable { viewModel.undo() }
-                    .wrapContentSize(Alignment.Center)
-            )
-            Text(
-                "↷",
-                style = MaterialTheme.typography.titleLarge,
-                color = PixelGrayLight,
-                modifier = Modifier
-                    .size(48.dp)
-                    .background(PixelSurfaceElevated)
-                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
-                    .clickable { viewModel.redo() }
-                    .wrapContentSize(Alignment.Center)
-            )
-            // Balde: aplica no próximo toque (define modo fill pendente).
-            Icon(
-                PixelIcons.fill(),
-                contentDescription = "Balde no próximo toque",
-                tint = PixelOrange,
-                modifier = Modifier
-                    .size(48.dp)
-                    .background(
-                        if (viewModel.pendingFill) PixelOrange.copy(alpha = 0.25f) else PixelSurfaceElevated
-                    )
-                    .border(1.dp, PixelGrayBorder, MaterialTheme.shapes.small)
-                    .clickable { viewModel.pendingFill = !viewModel.pendingFill }
-                    .padding(12.dp)
-            )
+            Spacer(Modifier.width(8.dp))
+            Text("Linhas UV", style = MaterialTheme.typography.labelSmall, color = PixelGray)
+            Spacer(Modifier.width(4.dp))
+            Switch(checked = showUv, onCheckedChange = { viewModel.setShowUv(it) }, modifier = Modifier.size(40.dp))
         }
         Spacer(Modifier.height(4.dp))
+        // RONDA A (J): dica curta e dispensável (a nota longa foi removida).
         Text(
-            "1 dedo pinta · 2 dedos navegam · o 3D em cima atualiza ao vivo " +
-                "(apenas a região alterada é reenviada à GPU)",
+            "1 dedo pinta · 2 dedos navegam · toque no 3D seleciona a face",
             style = MaterialTheme.typography.labelSmall,
             color = PixelGray
         )

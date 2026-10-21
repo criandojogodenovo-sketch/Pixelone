@@ -1,8 +1,8 @@
 package com.pixelone.studio.ui.texture3d
 
-import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.ViewConfiguration
 import android.opengl.GLSurfaceView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -20,8 +20,10 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
@@ -38,7 +40,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -80,9 +81,21 @@ import com.pixelone.studio.ui.theme.PixelSurfaceElevated
  *  - topo (~48 dp): voltar, nome do projeto, importar, menu;
  *  - seletor de modo (~52 dp): 3D | UV | Dividido (UV/Dividido bloqueados e
  *    explicados quando o modelo não tem UV);
- *  - área principal (peso ~55–60%): viewport 3D / vista UV / modo Dividido;
- *  - painel inferior (~170 dp, recolhível com um toque): muda por modo;
+ *  - área principal (TODO o espaço restante): viewport 3D / vista UV / modo
+ *    Dividido — no modo Dividido, 3D e textura dividem ao meio (≈40% do ecrã
+ *    cada em telemóveis típicos — requisito J da Ronda A);
+ *  - painel inferior (~180 dp, recolhível com um toque): muda por modo;
  *  - barra de navegação (~56 dp): Texture / 3D / 2D→3D.
+ *
+ * CORREÇÕES RONDA A:
+ *  - (A) INSETS: com enableEdgeToEdge (MainActivity), o ecrã desenha-se por
+ *    baixo das system bars — a barra superior passou a respeitar
+ *    [statusBarsPadding] e a barra de navegação [navigationBarsPadding].
+ *    Nenhum texto fica por baixo da hora/ícones do sistema. (As Fases 1–2
+ *    usam Scaffold/TopAppBar, que já respeitava insets — não foram tocadas.)
+ *  - SELEÇÃO: toque curto no viewport 3D seleciona a face/ilha por raycast
+ *    ([Studio3DViewModel.selectFaceAtNdc]); a seleção aparece na UV e nos
+ *    dois painéis do modo Dividido.
  *
  * Ao abrir: modelo de demonstração + textura demo JÁ visíveis (requisito —
  * sem passos escondidos). Nenhum menu cobre o viewport inteiro.
@@ -100,6 +113,9 @@ fun Texture3DStudioScreen(
     var showNewTextureDialog by remember { mutableStateOf(false) }
     var showOpenProjectDialog by remember { mutableStateOf(false) }
     var panelExpanded by remember { mutableStateOf(true) }
+
+    /** Referência viva à vista UV (para o botão "Focar" do painel). */
+    val uvViewHost = remember { mutableStateOf<TexturePaintView?>(null) }
 
     val mode by viewModel.mode.observeAsLocalState()
     val projectName by viewModel.projectName.observeAsLocalState()
@@ -145,10 +161,16 @@ fun Texture3DStudioScreen(
     Box(Modifier.fillMaxSize().background(PixelBlack)) {
         Column(Modifier.fillMaxSize()) {
 
-            // ---------------------- topo (~6%) -----------------------------
+            // ---------------------- topo -------------------------------
+            // RONDA A (A): statusBarsPadding — o conteúdo começa ABAIXO da
+            // hora/ícones; a cor da barra estende-se por baixo (edge-to-edge).
             Surface(color = PixelSurface, tonalElevation = 2.dp) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 4.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .height(48.dp)
+                        .padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
@@ -194,17 +216,19 @@ fun Texture3DStudioScreen(
                 }
             }
 
-            // ---------------------- seletor de modo (~7%) -------------------
+            // ---------------------- seletor de modo ---------------------
             ModeSelector(viewModel = viewModel, mode = mode)
 
-            // ---------------------- área principal (55–60%) -----------------
-            when (mode) {
-                StudioMode.THREE_D -> ThreeDMode(viewModel)
-                StudioMode.UV -> UvMode(viewModel)
-                StudioMode.SPLIT -> SplitMode(viewModel)
+            // ---------------------- área principal (resto do ecrã) ------
+            Box(Modifier.fillMaxWidth().weight(1f)) {
+                when (mode) {
+                    StudioMode.THREE_D -> ThreeDMode(viewModel)
+                    StudioMode.UV -> UvMode(viewModel, uvViewHost)
+                    StudioMode.SPLIT -> SplitMode(viewModel)
+                }
             }
 
-            // ---------------------- painel inferior (~20%) ------------------
+            // ---------------------- painel inferior ---------------------
             BottomPanel(
                 viewModel = viewModel,
                 mode = mode,
@@ -213,10 +237,13 @@ fun Texture3DStudioScreen(
                 onPaintTexture = {
                     viewModel.publishTextureToStudio2D()
                     onOpenTextureStudio()
-                }
+                },
+                uvViewHost = uvViewHost
             )
 
-            // ---------------------- barra de navegação (~6%) ----------------
+            // ---------------------- barra de navegação ------------------
+            // RONDA A (A): navigationBarsPadding — os itens ficam acima da
+            // barra de gestos/botões do sistema.
             Studio3DBottomNav(
                 onOpenTextureStudio = onOpenTextureStudio,
                 onOpen2Dto3D = onOpen2Dto3D
@@ -373,7 +400,7 @@ private fun ModeChip(
 
 @Composable
 private fun ThreeDMode(viewModel: Studio3DViewModel) {
-    Box(Modifier.fillMaxWidth().fillMaxHeight(0.58f)) {
+    Box(Modifier.fillMaxSize()) {
         Studio3DGlViewport(viewModel, Modifier.fillMaxSize())
 
         // Botão "Repor câmara" (requisito) — overlay, não cobre o viewport.
@@ -445,7 +472,8 @@ private fun ThreeDMode(viewModel: Studio3DViewModel) {
 }
 
 // ---------------------------------------------------------------------------
-// Viewport GL (GLSurfaceView) + gestos: 1 dedo roda; 2 dedos zoom e deslocam
+// Viewport GL (GLSurfaceView) + gestos: 1 dedo roda; 2 dedos zoom e deslocam;
+// TOQUE curto seleciona a face/ilha por raycast (requisito da Ronda A)
 // ---------------------------------------------------------------------------
 
 @Composable
@@ -463,6 +491,16 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
             var lastX = 0f
             var lastY = 0f
             var panning = false
+
+            // RONDA A — picking por toque: toque curto (sem passar o slop)
+            // converte o ponto para NDC e pede a seleção ao ViewModel.
+            var touchDownX = 0f
+            var touchDownY = 0f
+            var touchDownTime = 0L
+            var movedBeyondSlop = false
+            val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+            val tapTimeoutMs = 350L
+
             val scaleDetector = ScaleGestureDetector(
                 context,
                 object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -482,17 +520,37 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
                     1 -> when (e.actionMasked) {
                         MotionEvent.ACTION_DOWN -> {
                             lastX = e.x; lastY = e.y; panning = true
+                            touchDownX = e.x; touchDownY = e.y
+                            touchDownTime = System.currentTimeMillis()
+                            movedBeyondSlop = false
                             true
                         }
                         MotionEvent.ACTION_MOVE -> {
+                            // O arrasto passa o slop: já não é toque.
+                            val dx = e.x - touchDownX
+                            val dy = e.y - touchDownY
+                            if (dx * dx + dy * dy > touchSlop * touchSlop) movedBeyondSlop = true
                             // 1 dedo = RODAR a câmara (requisito).
                             viewModel.camera.rotate(e.x - lastX, e.y - lastY)
                             lastX = e.x; lastY = e.y
                             true
                         }
+                        MotionEvent.ACTION_UP -> {
+                            // TOQUE real: curto e sem arrasto → raycast.
+                            val dx = e.x - touchDownX
+                            val dy = e.y - touchDownY
+                            val quick = System.currentTimeMillis() - touchDownTime <= tapTimeoutMs
+                            if (!movedBeyondSlop && quick && width > 0 && height > 0) {
+                                val ndcX = 2f * e.x / width - 1f
+                                val ndcY = 1f - 2f * e.y / height
+                                viewModel.selectFaceAtNdc(ndcX, ndcY, width.toFloat() / height)
+                            }
+                            true
+                        }
                         else -> true
                     }
                     else -> {
+                        movedBeyondSlop = true
                         // 2 dedos = zoom (pinça) + deslocamento (requisito).
                         scaleDetector.onTouchEvent(e)
                         if (e.actionMasked == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress) {

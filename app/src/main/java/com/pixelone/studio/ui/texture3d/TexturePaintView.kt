@@ -9,14 +9,18 @@ import android.graphics.Path
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewConfiguration
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Superfície 2D de textura/UV do 3D Texture Studio (Fase 3).
  *
  * Usada em DOIS modos (requisitos da Fase 3):
  *  - VISTA UV: textura com as linhas UV sobrepostas (finas, semitransparentes,
- *    interruptor na UI), zoom/deslocamento com 2 dedos e TOQUE que seleciona
- *    a ilha UV tocada ([onUvTap] → ViewModel → realce no 3D);
+ *    interruptor na UI), zoom/deslocamento com 2 dedos e TOQUE (curto, sem
+ *    arrastar) que seleciona a ilha UV tocada ([onUvTap] → ViewModel → realce
+ *    no 3D);
  *  - PINTURA (modo Dividido): 1 dedo pinta (via [PixelEngine] no ViewModel,
  *    com histórico e ATUALIZAÇÃO PARCIAL da GPU), 2 dedos navegam.
  *
@@ -25,8 +29,20 @@ import android.view.View
  * vem do ViewModel (apresentação) e é atualizado REGIONALMENTE por traço
  * (Bitmap.setPixels da região suja) + [invalidate] — nunca recriado.
  *
- * Contorno UV e realce de ilha são desenhados de Paths EM CACHE (reconstruídos
- * só quando os dados mudam) — zero alocações por frame relevante.
+ * CORREÇÕES RONDA A (F, G, H + Focar):
+ *  - LINHAS UV FINAS (1 px DE ECRÃ): o path é desenhado dentro de um canvas
+ *    escalado — o strokeWidth passa a 1f/scale, senão as linhas multiplicam
+ *    pelo zoom (a 64× ficavam com 64 px). Anti-alias desligado: linha nítida
+ *    de 1 px, coerente com a identidade pixel art.
+ *  - REALCE POR TRIÂNGULO: os segmentos de realce chegam em TRIPLOS de
+ *    vértice (ax,ay,bx,by,cx,cy) e geram UM path fechado usado para FILL e
+ *    STROKE — o algoritmo antigo consumia os floats desalinhados e produzia
+    *    triângulos degenerados (etiqueta "12 tri." com 2 visíveis).
+ *  - GRELHA DE PÍXEIS: com zoom ≥ [GRID_MIN_SCALE] desenha-se uma grelha 1 px
+ *    alinhada aos píxeis da textura (requisito do botão "Focar").
+ *  - FOCAR: [focusOnIsland] faz zoom fit à caixa UV da ilha selecionada.
+ *  - TOQUE vs ARRASTAR: em UV_SELECT o toque só seleciona se o dedo não se
+ *    mexer mais do que o touchSlop — antes, TODO o início de pan selecionava.
  */
 class TexturePaintView(context: Context) : View(context) {
 
@@ -37,8 +53,16 @@ class TexturePaintView(context: Context) : View(context) {
 
     var textureBitmap: Bitmap? = null
     var uvSegments: FloatArray? = null
-    /** Segmentos da ilha selecionada (realce laranja). */
+
+    /**
+     * Segmentos da ilha selecionada em TRIPLOS de vértice (ax,ay,bx,by,cx,cy)
+     * por triângulo — 6 floats por triângulo (ver doc de classe).
+     */
     var islandHighlightSegments: FloatArray? = null
+
+    /** Caixa UV (u0,v0,u1,v1) da ilha selecionada — alvo do botão "Focar". */
+    var islandUvBounds: FloatArray? = null
+
     var surfaceMode: SurfaceMode = SurfaceMode.UV_SELECT
 
     var onUvTap: ((u: Float, v: Float) -> Unit)? = null
@@ -59,31 +83,48 @@ class TexturePaintView(context: Context) : View(context) {
         isFilterBitmap = false // NEAREST: sem interpolação
         isAntiAlias = false
     }
+
+    /**
+     * RONDA A (F): linhas UV FINAS e semitransparentes. O strokeWidth é
+     * definido a cada onDraw como 1f/scale — 1 px DE ECRÃ em qualquer zoom.
+     * Anti-alias OFF: 1 px nítido e sem escurecimento por sobreposição de AA.
+     */
     private val uvPaint = Paint().apply {
-        color = Color.argb(150, 255, 255, 255)
+        color = Color.argb(140, 255, 255, 255)
         strokeWidth = 1f
         style = Paint.Style.STROKE
-        isAntiAlias = true
+        isAntiAlias = false
     }
-    private val islandPaint = Paint().apply {
-        color = Color.argb(220, 0xFF, 0x7C, 0x00) // laranja Pixel One
-        strokeWidth = 2f
+
+    private val islandStrokePaint = Paint().apply {
+        color = Color.argb(230, 0xFF, 0x7C, 0x00) // laranja Pixel One
+        strokeWidth = 2f // 2f/scale em onDraw — 2 px de ecrã
         style = Paint.Style.STROKE
-        isAntiAlias = true
+        isAntiAlias = false
     }
+
     private val islandFillPaint = Paint().apply {
         color = Color.argb(70, 0xFF, 0x7C, 0x00)
         style = Paint.Style.FILL
         isAntiAlias = false
     }
+
+    /** Grelha de píxeis (Focar): 1 px semitransparente, alinhada à textura. */
+    private val gridPaint = Paint().apply {
+        color = Color.argb(60, 255, 255, 255)
+        strokeWidth = 1f // 1f/scale em onDraw
+        style = Paint.Style.STROKE
+        isAntiAlias = false
+    }
+
     private val checkerPaintA = Paint().apply { color = Color.argb(255, 34, 34, 34) }
     private val checkerPaintB = Paint().apply { color = Color.argb(255, 22, 22, 22) }
 
     // Paths em cache
     private var uvPath: Path? = null
-    private var highlightPath: Path? = null
-    private var highlightFillPath: Path? = null
-    private var cachedSegmentsKey: Int = 0
+    private var islandPath: Path? = null
+    private var uvCacheKey: Int = 0
+    private var islandCacheKey: Int = 0
 
     // ---------------------------- estado de gesto --------------------------
 
@@ -92,7 +133,12 @@ class TexturePaintView(context: Context) : View(context) {
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var activePointerId = -1
-    private var gestureSpanStart = 0f
+
+    /** Deteção de TOQUE (vs arrastar) na vista UV — requisito Ronda A. */
+    private var tapCandidate = false
+    private var tapStartX = 0f
+    private var tapStartY = 0f
+    private val touchSlop: Int = ViewConfiguration.get(context).scaledTouchSlop
 
     private val scaleDetector = ScaleGestureDetector(
         context,
@@ -147,31 +193,55 @@ class TexturePaintView(context: Context) : View(context) {
         canvas.drawBitmap(bmp, 0f, 0f, texturePaint)
         canvas.drawRect(0f, 0f, bmp.width.toFloat(), bmp.height.toFloat(), borderPaint())
 
-        // Sobreposição UV (finas, semitransparentes — requisito) + realce.
+        // Grelha de píxeis (requisito "Focar"): só com zoom suficiente — a
+        // textura de 256 px a escala 8 são 512 linhas 1 px, barato e raro.
+        if (scale >= GRID_MIN_SCALE) {
+            drawPixelGrid(canvas, bmp.width.toFloat(), bmp.height.toFloat())
+        }
+
+        // Sobreposição UV: 1 px de ECRÃ, semitransparente (requisito F).
         val segments = uvSegments
         if (segments != null && segments.isNotEmpty()) {
-            if (uvPath == null || cachedSegmentsKey != segments.size * 31 + surfaceMode.ordinal) {
-                uvPath = buildPath(segments, bmp.width.toFloat(), bmp.height.toFloat(), closed = false)
-                cachedSegmentsKey = segments.size * 31 + surfaceMode.ordinal
+            val key = segments.contentHashCode()
+            if (uvPath == null || uvCacheKey != key) {
+                uvPath = buildWirePath(segments, bmp.width.toFloat(), bmp.height.toFloat())
+                uvCacheKey = key
             }
+            uvPaint.strokeWidth = 1f / scale
             uvPath?.let { canvas.drawPath(it, uvPaint) }
         }
+
+        // Realce da ilha selecionada: UM path fechado por triângulo
+        // (fill + stroke 2 px de ecrã) — corrige o fill degenerado (H).
         val highlight = islandHighlightSegments
         if (highlight != null && highlight.isNotEmpty()) {
-            if (highlightPath == null || highlightKeyChanged(highlight)) {
-                highlightPath = buildPath(highlight, bmp.width.toFloat(), bmp.height.toFloat(), closed = false)
-                highlightFillPath = buildPath(highlight, bmp.width.toFloat(), bmp.height.toFloat(), closed = true)
-                highlightCacheKey = highlight.size * 17 + highlight.contentHashCode()
+            val key = highlight.contentHashCode()
+            if (islandPath == null || islandCacheKey != key) {
+                islandPath = buildIslandPath(highlight, bmp.width.toFloat(), bmp.height.toFloat())
+                islandCacheKey = key
             }
-            highlightFillPath?.let { canvas.drawPath(it, islandFillPaint) }
-            highlightPath?.let { canvas.drawPath(it, islandPaint) }
+            islandStrokePaint.strokeWidth = 2f / scale
+            islandPath?.let {
+                canvas.drawPath(it, islandFillPaint)
+                canvas.drawPath(it, islandStrokePaint)
+            }
         }
         canvas.restore()
     }
 
-    private var highlightCacheKey = 0
-    private fun highlightKeyChanged(segments: FloatArray): Boolean =
-        highlightCacheKey != segments.size * 17 + segments.contentHashCode()
+    /** Grelha 1 px alinhada aos píxeis da textura (limites de cada píxel). */
+    private fun drawPixelGrid(canvas: Canvas, texW: Float, texH: Float) {
+        var gx = 0f
+        while (gx <= texW) {
+            canvas.drawLine(gx, 0f, gx, texH, gridPaint)
+            gx += 1f
+        }
+        var gy = 0f
+        while (gy <= texH) {
+            canvas.drawLine(0f, gy, texW, gy, gridPaint)
+            gy += 1f
+        }
+    }
 
     private fun borderPaint(): Paint = Paint().apply {
         color = Color.argb(120, 158, 158, 158)
@@ -180,29 +250,36 @@ class TexturePaintView(context: Context) : View(context) {
         isAntiAlias = false
     }
 
-    private fun buildPath(
-        segments: FloatArray,
-        texW: Float,
-        texH: Float,
-        closed: Boolean
-    ): Path {
+    /**
+     * Path da sobreposição UV: pares de pontos (x0,y0,x1,y1) em UV — linhas
+     * abertas (sem fechar triângulos), para não duplicar arestas partilhadas.
+     */
+    private fun buildWirePath(segments: FloatArray, texW: Float, texH: Float): Path {
         val path = Path()
         var i = 0
         while (i + 3 < segments.size) {
-            val x0 = segments[i] * texW
-            val y0 = segments[i + 1] * texH
-            val x1 = segments[i + 2] * texW
-            val y1 = segments[i + 3] * texH
-            path.moveTo(x0, y0)
-            path.lineTo(x1, y1)
-            if (closed && i + 7 < segments.size) {
-                // Fecha triângulos em pares (0-1, 1-2, 2-0): usa o 3.º segmento.
-                path.lineTo(segments[i + 4] * texW, segments[i + 5] * texH)
-                path.close()
-                i += 6
-                continue
-            }
+            path.moveTo(segments[i] * texW, segments[i + 1] * texH)
+            path.lineTo(segments[i + 2] * texW, segments[i + 3] * texH)
             i += 4
+        }
+        return path
+    }
+
+    /**
+     * Path de realce a partir de TRIPLOS de vértice (6 floats por triângulo):
+     * moveTo(a) → lineTo(b) → lineTo(c) → close. Um só path serve o FILL e o
+     * STROKE — o antigo algoritmo "closed" consumia i+=6 floats (meio
+     * triângulo) e gerava a→b→b degenerado (invisível).
+     */
+    private fun buildIslandPath(triples: FloatArray, texW: Float, texH: Float): Path {
+        val path = Path()
+        var i = 0
+        while (i + 5 < triples.size) {
+            path.moveTo(triples[i] * texW, triples[i + 1] * texH)
+            path.lineTo(triples[i + 2] * texW, triples[i + 3] * texH)
+            path.lineTo(triples[i + 4] * texW, triples[i + 5] * texH)
+            path.close()
+            i += 6
         }
         return path
     }
@@ -222,6 +299,7 @@ class TexturePaintView(context: Context) : View(context) {
                     lastTouchX = event.x
                     lastTouchY = event.y
                     activePointerId = event.getPointerId(0)
+                    tapCandidate = false
                     return true
                 }
                 when (event.actionMasked) {
@@ -229,14 +307,13 @@ class TexturePaintView(context: Context) : View(context) {
                         activePointerId = event.getPointerId(0)
                         lastTouchX = event.x
                         lastTouchY = event.y
-                        val (px, py) = toPixel(event.x, event.y)
+                        tapCandidate = true
+                        tapStartX = event.x
+                        tapStartY = event.y
                         if (surfaceMode == SurfaceMode.PAINT) {
+                            val (px, py) = toPixel(event.x, event.y)
                             painting = true
                             onPaintBegin?.invoke(px, py)
-                        } else {
-                            val bw = textureBitmap?.width?.toFloat() ?: 1f
-                            val bh = textureBitmap?.height?.toFloat() ?: 1f
-                            onUvTap?.invoke(px / bw.coerceAtLeast(1f), py / bh.coerceAtLeast(1f))
                         }
                         parent?.requestDisallowInterceptTouchEvent(true)
                         return true
@@ -249,8 +326,16 @@ class TexturePaintView(context: Context) : View(context) {
                             lastTouchY = event.y
                             return true
                         }
-                        // Pan com 1 dedo no modo UV (navegação).
-                        if (surfaceMode == SurfaceMode.UV_SELECT) {
+                        // RONDA A: se o dedo passou o touchSlop deixou de ser
+                        // toque — passa a pan (na vista UV).
+                        if (tapCandidate) {
+                            val dx = event.x - tapStartX
+                            val dy = event.y - tapStartY
+                            if (dx * dx + dy * dy > touchSlop * touchSlop) {
+                                tapCandidate = false
+                            }
+                        }
+                        if (surfaceMode == SurfaceMode.UV_SELECT && !tapCandidate) {
                             transX += event.x - lastTouchX
                             transY += event.y - lastTouchY
                             lastTouchX = event.x
@@ -265,6 +350,16 @@ class TexturePaintView(context: Context) : View(context) {
                             painting = false
                             onPaintEnd?.invoke()
                         }
+                        // TOQUE real: só UP curto e sem arrasto seleciona (G).
+                        if (surfaceMode == SurfaceMode.UV_SELECT &&
+                            tapCandidate && event.actionMasked == MotionEvent.ACTION_UP
+                        ) {
+                            val (px, py) = toPixel(event.x, event.y)
+                            val bw = textureBitmap?.width?.toFloat() ?: 1f
+                            val bh = textureBitmap?.height?.toFloat() ?: 1f
+                            onUvTap?.invoke(px / bw.coerceAtLeast(1f), py / bh.coerceAtLeast(1f))
+                        }
+                        tapCandidate = false
                         return true
                     }
                 }
@@ -273,6 +368,7 @@ class TexturePaintView(context: Context) : View(context) {
             else -> {
                 // 2 dedos: zoom + pan (requisito da vista UV). Pintura cancelada.
                 multiTouch = true
+                tapCandidate = false
                 if (painting) {
                     painting = false
                     onPaintEnd?.invoke()
@@ -310,7 +406,6 @@ class TexturePaintView(context: Context) : View(context) {
     // ---------------------------- utilitários -------------------------------
 
     private fun toPixel(sx: Float, sy: Float): Pair<Int, Int> {
-        val bmp = textureBitmap ?: return Pair(-1, -1)
         val px = ((sx - transX) / scale).toInt()
         val py = ((sy - transY) / scale).toInt()
         return Pair(px, py)
@@ -326,6 +421,31 @@ class TexturePaintView(context: Context) : View(context) {
         ).coerceIn(MIN_SCALE, MAX_SCALE)
         transX = (width - bmp.width * scale) / 2f
         transY = (height - bmp.height * scale) / 2f
+        fitDone = true
+        clampTransform()
+        invalidate()
+    }
+
+    /**
+     * FOCAR (requisito Ronda A): zoom automático à caixa UV da ilha
+     * selecionada (u0,v0,u1,v1), centrada com 10% de respiro. Com o zoom
+     * resultante ≥ [GRID_MIN_SCALE] a grelha de píxeis fica visível.
+     */
+    fun focusOnIsland(u0: Float, v0: Float, u1: Float, v1: Float) {
+        val bmp = textureBitmap ?: return
+        if (width <= 0 || height <= 0 || bmp.width <= 0 || bmp.height <= 0) return
+        val bw = bmp.width.toFloat()
+        val bh = bmp.height.toFloat()
+        val padU = max(0.04f, (u1 - u0) * 0.1f)
+        val padV = max(0.04f, (v1 - v0) * 0.1f)
+        val boxW = max(1e-4f, (u1 - u0) + 2f * padU) * bw
+        val boxH = max(1e-4f, (v1 - v0) + 2f * padV) * bh
+        val fitScale = min(width / boxW, height / boxH).coerceIn(MIN_SCALE, MAX_SCALE)
+        scale = fitScale
+        val cxUv = (u0 + u1) / 2f * bw
+        val cyUv = (v0 + v1) / 2f * bh
+        transX = width / 2f - cxUv * scale
+        transY = height / 2f - cyUv * scale
         fitDone = true
         clampTransform()
         invalidate()
@@ -349,5 +469,8 @@ class TexturePaintView(context: Context) : View(context) {
     companion object {
         const val MIN_SCALE = 0.05f
         const val MAX_SCALE = 64f
+
+        /** Zoom mínimo para desenhar a grelha de píxeis (evita 1000s de linhas). */
+        const val GRID_MIN_SCALE = 6f
     }
 }

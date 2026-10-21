@@ -113,8 +113,21 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     /** Malha selecionada na vista UV (null = todas). */
     val selectedMesh = MutableLiveData<Int?>(null)
 
-    /** Ilha selecionada (vista UV): primitiva + ilha. */
-    data class IslandSelection(val renderableIndex: Int, val island: UvIsland)
+    /**
+     * Seleção partilhada pelos painéis 3D e UV (requisito Ronda A: no modo
+     * Dividido aparece nos DOIS painéis em simultâneo).
+     *
+     * @param renderableIndex primitiva tocada.
+     * @param island ilha UV que contém a face tocada (destacada na vista UV).
+     * @param faceTriangle índice do TRIÂNGULO tocado pelo raycast (null quando
+     *        a seleção veio da vista UV — aí a unidade é a ilha inteira).
+     *        No demo, face == ilha (1 ilha por face).
+     */
+    data class IslandSelection(
+        val renderableIndex: Int,
+        val island: UvIsland,
+        val faceTriangle: Int? = null
+    )
 
     val selectedIsland = MutableLiveData<IslandSelection?>(null)
 
@@ -546,8 +559,38 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
-    // Seleção de ilha UV (vista UV)
+    // Seleção de face/ilha — toque no 3D (raycast) e na vista UV
     // ------------------------------------------------------------------
+
+    /**
+     * TOQUE NO MODELO 3D (requisito Ronda A): converte o ponto NDC num raio da
+     * câmara atual, encontra o triângulo mais próximo ([MeshPicking]) e
+     * seleciona a FACE tocada + a ILHA UV que a contém. O realce laranja
+     * aparece no 3D (ilha da face) e na vista UV (mesma ilha) — nada simulado.
+     */
+    fun selectFaceAtNdc(ndcX: Float, ndcY: Float, aspect: Float) {
+        val ray = MeshPicking.rayFromNdc(camera, ndcX, ndcY, aspect)
+        val hit = MeshPicking.pick(model, ray)
+        if (hit == null) {
+            // Toque fora do modelo: limpa a seleção (comportamento previsível).
+            clearIslandSelection()
+            return
+        }
+        val island = islandContaining(hit.renderableIndex, hit.triangleIndex)
+        if (island == null) {
+            clearIslandSelection()
+            return
+        }
+        selectedIsland.value = IslandSelection(hit.renderableIndex, island, hit.triangleIndex)
+        selectedMaterial.value = model.renderables.getOrNull(hit.renderableIndex)?.materialIndex
+        applyHighlightToRenderer()
+    }
+
+    /** Ilha de uma primitiva que contém o triângulo dado (busca linear — só no toque). */
+    private fun islandContaining(renderableIndex: Int, triangleIndex: Int): UvIsland? {
+        val islands = uvIslands[renderableIndex] ?: return null
+        return islands.firstOrNull { island -> island.triangleIndices.any { it == triangleIndex } }
+    }
 
     /**
      * Toque na vista UV: converte (u, v) e procura a ilha tocada; destaca-a
@@ -560,7 +603,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
             val hit = UvIslands.hitTest(islands, r.indices, uvs, u, v)
             if (hit != null) {
                 selectedIsland.value = IslandSelection(index, hit)
-                renderer?.setHighlight(index, hit.triangleIndices)
+                applyHighlightToRenderer()
                 selectedMaterial.value = r.materialIndex
                 return
             }
@@ -573,6 +616,16 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     fun clearIslandSelection() {
         selectedIsland.value = null
         renderer?.setHighlight(null, null)
+    }
+
+    /**
+     * Caixa UV (u0, v0, u1, v1) da ilha selecionada — alvo do botão "Focar"
+     * (zoom automático da vista UV na ilha, requisito Ronda A).
+     */
+    fun selectedIslandUvBounds(): FloatArray? {
+        val sel = selectedIsland.value ?: return null
+        val island = sel.island
+        return floatArrayOf(island.minU, island.minV, island.maxU, island.maxV)
     }
 
     // ------------------------------------------------------------------
@@ -829,7 +882,13 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         return arr
     }
 
-    /** Segmentos UV da ilha selecionada (realce laranja na vista UV). */
+    /**
+     * Triângulos da ilha selecionada em TRIPLOS de vértice (ax,ay,bx,by,cx,cy)
+     * — 6 floats por triângulo. Formato consumido por
+     * [com.pixelone.studio.ui.texture3d.TexturePaintView] para o path fechado
+     * de realce (fill + stroke) — o formato antigo de segmentos gerava fills
+     * degenerados (problema H da Ronda A).
+     */
     fun islandHighlightSegments(): FloatArray? {
         val sel = selectedIsland.value ?: return null
         val r = model.renderables.getOrNull(sel.renderableIndex) ?: return null
@@ -839,10 +898,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
             val a = r.indices[t * 3]; val b = r.indices[t * 3 + 1]; val c = r.indices[t * 3 + 2]
             out.add(uvs[a * 2]); out.add(uvs[a * 2 + 1])
             out.add(uvs[b * 2]); out.add(uvs[b * 2 + 1])
-            out.add(uvs[b * 2]); out.add(uvs[b * 2 + 1])
             out.add(uvs[c * 2]); out.add(uvs[c * 2 + 1])
-            out.add(uvs[c * 2]); out.add(uvs[c * 2 + 1])
-            out.add(uvs[a * 2]); out.add(uvs[a * 2 + 1])
         }
         return FloatArray(out.size) { out[it] }
     }

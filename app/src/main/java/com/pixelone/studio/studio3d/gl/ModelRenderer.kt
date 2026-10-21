@@ -244,6 +244,17 @@ class ModelRenderer(
         GLES20.glEnable(GLES20.GL_CULL_FACE)
         GLES20.glCullFace(GLES20.GL_BACK)
         GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
+
+        // RONDA A (C): o contexto pode ser NOVO (app em 2.º plano, rotação,
+        // mudança de GPU) — TODOS os ids GL guardados ficaram STALE. Sem esta
+        // reposição, ensureDocumentTexture fazia early-return (mesmas
+        // dimensões) e o cubo ficava a amostrar uma textura inválida (cor
+        // plana/undefined em vez do desenho). O id antigo pertence a um
+        // contexto morto: apagá-lo seria operar sobre ids inválidos.
+        documentTexture = 0
+        highlightIbo = 0
+        highlightIndexCount = 0
+
         // Contexto pode ser novo: recriar a textura do documento e a cena.
         if (documentTexWidth > 0 && documentTexHeight > 0) {
             ensureDocumentTexture(documentTexWidth, documentTexHeight)
@@ -252,6 +263,10 @@ class ModelRenderer(
         val request = lastSceneRequest
         if (request != null) {
             rebuildScene(request.model, request.embeddedBitmaps, request.bindings)
+        }
+        // Realce da seleção: o IBO também morreu com o contexto.
+        if (highlightRenderable != null && highlightTriangles != null) {
+            rebuildHighlightBuffer()
         }
     }
 
