@@ -150,6 +150,30 @@ object PixelIcons {
         )
     }
 
+    /** Linha (ferramenta Ronda B) — barra diagonal fina. */
+    fun line(): ImageVector = vector("Line") {
+        pathData("M18.6,3.4L20.6,5.4 5.4,20.6 3.4,18.6z")
+    }
+
+    /** Retângulo (contorno — ferramenta Ronda B). */
+    fun rect(): ImageVector = vector("Rect") {
+        pathData("M3,5h18v14H3V5zm2,2v10h14V7H5z")
+    }
+
+    /** Camadas (painel da Ronda B) — pilha estilo Material "Layers". */
+    fun layers(): ImageVector = vector("Layers") {
+        pathData(
+            "M11.99,18.54l-7.37,-5.73L3,14.07l9,7 9,-7 -1.63,-1.27 -7.38,5.74zM12,16l7.36,-5.73L21,9l-9,-7 -9,7 1.63,1.27L12,16z"
+        )
+    }
+
+    /** Espelho/simetria (eixo vertical com dois triângulos). */
+    fun flip(): ImageVector = vector("Flip") {
+        pathData("M11,3h2v18h-2z")
+        pathData("M9,7L3,12l6,5V7z")
+        pathData("M15,7v10l6,-5 -6,-5z")
+    }
+
     // ------------------------------------------------------------------
     // Helper
     // ------------------------------------------------------------------

@@ -62,6 +62,7 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.Observer
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pixelone.studio.studio3d.GltfLimits
+import com.pixelone.studio.studio3d.PaintCore
 import com.pixelone.studio.studio3d.Studio3DState.SamplingMode
 import com.pixelone.studio.studio3d.Studio3DState.StudioMode
 import com.pixelone.studio.studio3d.Studio3DViewModel
@@ -146,6 +147,18 @@ fun Texture3DStudioScreen(
         if (uri != null) viewModel.importModelFromUri(uri)
     }
 
+    // ---------------------- exportações (Ronda B) --------------------------
+    val exportTextureLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("image/png")
+    ) { uri ->
+        if (uri != null) viewModel.exportTextureTo(uri)
+    }
+    val exportUvTemplateLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("image/png")
+    ) { uri ->
+        if (uri != null) viewModel.exportUvTemplateTo(uri)
+    }
+
     // --------------------------- retorno com guarda ------------------------
     BackHandler {
         onBack()
@@ -203,6 +216,14 @@ fun Texture3DStudioScreen(
                             expanded = showMenu,
                             onDismiss = { showMenu = false },
                             viewModel = viewModel,
+                            onExportTexture = {
+                                showMenu = false
+                                exportTextureLauncher.launch("textura.png")
+                            },
+                            onExportUvTemplate = {
+                                showMenu = false
+                                exportUvTemplateLauncher.launch("gabarito-uv.png")
+                            },
                             onOpenProjects = {
                                 showMenu = false
                                 showOpenProjectDialog = true
@@ -218,6 +239,12 @@ fun Texture3DStudioScreen(
 
             // ---------------------- seletor de modo ---------------------
             ModeSelector(viewModel = viewModel, mode = mode)
+
+            // ---------------------- barra de pintura (Ronda B) ----------
+            // SEMPRE visível: Pintar/Navegar, ferramentas, cor e
+            // Desfazer/Refazer — fora de qualquer painel recolhível.
+            val paintState by viewModel.paint.observeAsLocalState()
+            PaintToolBar(viewModel = viewModel, state = paintState)
 
             // ---------------------- área principal (resto do ecrã) ------
             Box(Modifier.fillMaxWidth().weight(1f)) {
@@ -299,9 +326,19 @@ private fun Studio3DMenu(
     onDismiss: () -> Unit,
     viewModel: Studio3DViewModel,
     onOpenProjects: () -> Unit,
-    onNewTexture: () -> Unit
+    onNewTexture: () -> Unit,
+    onExportTexture: () -> Unit = {},
+    onExportUvTemplate: () -> Unit = {}
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        DropdownMenuItem(
+            text = { Text("Exportar textura (PNG)") },
+            onClick = onExportTexture
+        )
+        DropdownMenuItem(
+            text = { Text("Exportar gabarito UV (PNG)") },
+            onClick = onExportUvTemplate
+        )
         DropdownMenuItem(
             text = { Text("Guardar projeto") },
             onClick = { onDismiss(); viewModel.saveProject() }
@@ -498,6 +535,8 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
             var touchDownY = 0f
             var touchDownTime = 0L
             var movedBeyondSlop = false
+            // RONDA B: true entre DOWN (que acertou no modelo) e UP — o traço 3D.
+            var painting3d = false
             val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
             val tapTimeoutMs = 350L
 
@@ -516,6 +555,21 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
                 }
             )
             setOnTouchListener { v, e ->
+                // RONDA B: estado de pintura lido POR EVENTO (a barra alterna
+                // Pintar/Navegar sem recriar a vista).
+                val paintState = viewModel.paint.value
+                val paintEnabled = paintState?.paintMode == true
+                val tool = paintState?.tool ?: PaintCore.Tool.PENCIL
+                val strokeTool = tool == PaintCore.Tool.PENCIL ||
+                    tool == PaintCore.Tool.ERASER ||
+                    tool == PaintCore.Tool.LINE ||
+                    tool == PaintCore.Tool.RECT
+                val discreteTool = tool == PaintCore.Tool.FILL ||
+                    tool == PaintCore.Tool.EYEDROPPER
+
+                fun ndc(ev: MotionEvent): Pair<Float, Float> =
+                    Pair(2f * ev.x / width - 1f, 1f - 2f * ev.y / height)
+
                 when (e.pointerCount) {
                     1 -> when (e.actionMasked) {
                         MotionEvent.ACTION_DOWN -> {
@@ -523,6 +577,14 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
                             touchDownX = e.x; touchDownY = e.y
                             touchDownTime = System.currentTimeMillis()
                             movedBeyondSlop = false
+                            if (paintEnabled && strokeTool) {
+                                // PINTAR: 1 dedo = raycast → UV → texel.
+                                val (nx, ny) = ndc(e)
+                                painting3d = viewModel.paintAtNdc(
+                                    nx, ny, width.toFloat() / height, isStart = true
+                                )
+                                if (painting3d) panning = false // não roda durante o traço
+                            }
                             true
                         }
                         MotionEvent.ACTION_MOVE -> {
@@ -530,20 +592,39 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
                             val dx = e.x - touchDownX
                             val dy = e.y - touchDownY
                             if (dx * dx + dy * dy > touchSlop * touchSlop) movedBeyondSlop = true
-                            // 1 dedo = RODAR a câmara (requisito).
-                            viewModel.camera.rotate(e.x - lastX, e.y - lastY)
+                            if (painting3d) {
+                                // Traço contínuo: interpolação entre pontos de
+                                // impacto (Bresenham em UV no funil de pintura).
+                                val (nx, ny) = ndc(e)
+                                viewModel.paintAtNdc(
+                                    nx, ny, width.toFloat() / height, isStart = false
+                                )
+                            } else if (panning) {
+                                // 1 dedo = RODAR a câmara (requisito).
+                                viewModel.camera.rotate(e.x - lastX, e.y - lastY)
+                            }
                             lastX = e.x; lastY = e.y
                             true
                         }
                         MotionEvent.ACTION_UP -> {
-                            // TOQUE real: curto e sem arrasto → raycast.
-                            val dx = e.x - touchDownX
-                            val dy = e.y - touchDownY
-                            val quick = System.currentTimeMillis() - touchDownTime <= tapTimeoutMs
-                            if (!movedBeyondSlop && quick && width > 0 && height > 0) {
-                                val ndcX = 2f * e.x / width - 1f
-                                val ndcY = 1f - 2f * e.y / height
-                                viewModel.selectFaceAtNdc(ndcX, ndcY, width.toFloat() / height)
+                            if (painting3d) {
+                                viewModel.paintEndUv()
+                                painting3d = false
+                            } else {
+                                val dx = e.x - touchDownX
+                                val dy = e.y - touchDownY
+                                val quick = System.currentTimeMillis() - touchDownTime <= tapTimeoutMs
+                                if (paintEnabled && discreteTool && width > 0 && height > 0) {
+                                    // Balde/conta-gotas no 3D (toque único).
+                                    val (nx, ny) = ndc(e)
+                                    viewModel.discreteAtNdc(nx, ny, width.toFloat() / height)
+                                } else if (!paintEnabled && !movedBeyondSlop && quick &&
+                                    width > 0 && height > 0
+                                ) {
+                                    // NAVEGAR: toque curto seleciona a face/ilha (Ronda A).
+                                    val (nx, ny) = ndc(e)
+                                    viewModel.selectFaceAtNdc(nx, ny, width.toFloat() / height)
+                                }
                             }
                             true
                         }
@@ -551,7 +632,12 @@ internal fun Studio3DGlViewport(viewModel: Studio3DViewModel, modifier: Modifier
                     }
                     else -> {
                         movedBeyondSlop = true
-                        // 2 dedos = zoom (pinça) + deslocamento (requisito).
+                        // 2 dedos = zoom (pinça) + deslocamento (requisito) —
+                        // mesmo em modo Pintar (nunca pinta com 2 dedos).
+                        if (painting3d) {
+                            viewModel.paintEndUv()
+                            painting3d = false
+                        }
                         scaleDetector.onTouchEvent(e)
                         if (e.actionMasked == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress) {
                             val cx = (e.getX(0) + e.getX(1)) / 2f
