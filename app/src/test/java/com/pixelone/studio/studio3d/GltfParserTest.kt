@@ -507,4 +507,160 @@ class GltfParserTest {
         assertEquals(1f, p[0], 1e-6f)
         assertEquals(9f, p[8], 1e-6f)
     }
+
+    // ------------------------------------------------------------------
+    // Deteção por CONTEÚDO e importação .gltf + .bin (missão 3D import)
+    // ------------------------------------------------------------------
+
+    /** Triângulo simples (3 vértices + 3 índices ushort) como bytes de .bin. */
+    private fun triangleBin(): ByteArray {
+        val positions = floatArrayOf(0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, 0f)
+        return ByteArrayOutputStream().apply {
+            positions.forEach { write(leFloat(it)) }
+            write(le16(0)); write(le16(1)); write(le16(2))
+        }.toByteArray()
+    }
+
+    /** glTF JSON solto cujo buffer 0 é o .bin externo "modelo.bin". */
+    private fun triangleGltfWithExternalBin(bufferUri: String = "modelo.bin"): String = """
+        {"asset": {"version": "2.0"},
+         "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+         "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]}],
+         "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}
+         ],
+         "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 6}
+         ],
+         "materials": [{"name": "m"}],
+         "buffers": [{"byteLength": 42, "uri": "$bufferUri"}]}
+    """.trimIndent()
+
+    @Test
+    fun `deteção por conteúdo ignora extensão e mime`() {
+        // GLB com nome errado continua a ser GLB; JSON com nome errado continua
+        // a ser modelo — e bytes arbitrários não se disfarçam de modelo.
+        val glb = quadGlb()
+        val json = triangleGltfWithExternalBin().toByteArray(Charsets.UTF_8)
+        assertTrue(GltfParser.isGlb(glb))
+        assertTrue(GltfParser.looksLikeModelJson(json))
+        assertTrue(GltfParser.looksLikeModel(glb))
+        assertTrue(GltfParser.looksLikeModel(json))
+        assertFalse(GltfParser.looksLikeModel("PK\u0003\u0004 zip qualquer".toByteArray()))
+        assertFalse(GltfParser.looksLikeModel("<html>erro 404</html>".toByteArray()))
+    }
+
+    @Test
+    fun `gltf com BOM UTF-8 parseia`() {
+        // Bug real: ficheiros .gltf gravados com BOM (EF BB BF) falhavam a
+        // verificação do "{" inicial e eram recusados como "formato não
+        // suportado".
+        val bin = triangleBin()
+        val base64 = java.util.Base64.getEncoder().encodeToString(bin)
+        val json = """
+        {"asset": {"version": "2.0"},
+         "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+         "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]}],
+         "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}
+         ],
+         "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 6}
+         ],
+         "materials": [{"name": "m"}],
+         "buffers": [{"byteLength": 42, "uri": "data:application/octet-stream;base64,$base64"}]}
+        """.trimIndent()
+        val withBom = byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()) + json.toByteArray(Charsets.UTF_8)
+        assertTrue(GltfParser.looksLikeModelJson(withBom))
+        val model = GltfParser.parse(withBom, "modelo_com_bom.gltf")
+        assertEquals(1, model.triangleCount)
+    }
+
+    @Test
+    fun `conteúdo desconhecido mostra diagnóstico real no erro`() {
+        try {
+            GltfParser.parse("isto não é um modelo".toByteArray(), "acidente.glb")
+            org.junit.Assert.fail("Deveria ter falhado")
+        } catch (e: GltfParser.GltfParseException) {
+            val msg = e.message!!
+            assertTrue("falta a frase base: $msg", msg.contains("Formato de modelo não suportado"))
+            assertTrue("falta o nome: $msg", msg.contains("acidente.glb"))
+            assertTrue("faltam os hex dos primeiros bytes: $msg", msg.contains("69 73 74 6F"))
+            assertTrue("falta o tamanho: $msg", msg.contains("bytes"))
+        }
+    }
+
+    @Test
+    fun `buffer externo é resolvido com o bin selecionado`() {
+        val json = triangleGltfWithExternalBin()
+        val bytes = json.toByteArray(Charsets.UTF_8)
+        val bin = triangleBin()
+        val model = GltfParser.parse(bytes, "modelo.gltf", mapOf("modelo.bin" to bin))
+        assertEquals(1, model.triangleCount)
+        assertEquals(3, model.renderables[0].positions.size / 3)
+        assertEquals(listOf(0, 1, 2), model.renderables[0].indices.toList())
+    }
+
+    @Test
+    fun `buffer externo resolve por basename ignorando caminho e maiúsculas`() {
+        val json = triangleGltfWithExternalBin(bufferUri = "./dados/MODELO.BIN")
+        val bin = triangleBin()
+        val model = GltfParser.parse(
+            json.toByteArray(Charsets.UTF_8), "modelo.gltf", mapOf("modelo.bin" to bin)
+        )
+        assertEquals(1, model.triangleCount)
+    }
+
+    @Test
+    fun `buffer externo sem bin orienta para glb ou seleção conjunta`() {
+        val json = triangleGltfWithExternalBin()
+        try {
+            GltfParser.parse(json.toByteArray(Charsets.UTF_8), "modelo.gltf")
+            org.junit.Assert.fail("Deveria ter falhado")
+        } catch (e: GltfParser.GltfParseException) {
+            val msg = e.message!!
+            assertTrue("falta 'buffer EXTERNO': $msg", msg.contains("buffer EXTERNO"))
+            assertTrue("falta a orientação .glb: $msg", msg.contains(".glb"))
+            assertTrue("falta a orientação .bin: $msg", msg.contains(".bin"))
+            assertTrue("falta o uri em falta: $msg", msg.contains("modelo.bin"))
+        }
+    }
+
+    @Test
+    fun `imagem externa é resolvida com o ficheiro selecionado`() {
+        val json = """
+        {"asset": {"version": "2.0"},
+         "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+         "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "material": 0}]}],
+         "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}],
+         "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+         "images": [{"uri": "textura.png"}],
+         "materials": [{"name": "m", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+         "textures": [{"source": 0}],
+         "buffers": [{"byteLength": 36, "uri": "modelo.bin"}]}
+        """.trimIndent()
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)
+        val model = GltfParser.parse(
+            json.toByteArray(Charsets.UTF_8), "modelo.gltf",
+            mapOf("modelo.bin" to triangleBin().copyOf(36), "textura.png" to png)
+        )
+        assertEquals(0, model.materials[0].textureImageIndex)
+        assertEquals(png.size, model.images[0].bytes.size)
+        assertEquals("image/png", model.images[0].mimeType)
+    }
+
+    @Test
+    fun `nenhum modelo na seleção devolve diagnóstico do primeiro ficheiro`() {
+        val zip = "PK\u0003\u0004 conteudo zip".toByteArray()
+        try {
+            GltfParser.parse(zip, "descarga.zip")
+            org.junit.Assert.fail("Deveria ter falhado")
+        } catch (e: GltfParser.GltfParseException) {
+            assertTrue(e.message!!.contains("descarga.zip"))
+        }
+    }
 }

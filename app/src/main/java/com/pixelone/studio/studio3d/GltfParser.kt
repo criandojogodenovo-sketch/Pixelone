@@ -100,11 +100,51 @@ object GltfParser {
     fun isGlb(bytes: ByteArray): Boolean =
         bytes.size >= 12 && readU32(bytes, 0) == GLB_MAGIC
 
+    /** JSON de modelo glTF: começa por "{" (tolerando BOM UTF-8 e espaços). */
+    fun looksLikeModelJson(bytes: ByteArray): Boolean {
+        if (bytes.isEmpty()) return false
+        val text = stripUtf8Bom(String(bytes, Charsets.UTF_8))
+        return text.trimStart().startsWith("{")
+    }
+
+    /** Verdadeiro se os bytes parecem um modelo glTF/GLB pelo CONTEÚDO (nunca pela extensão). */
+    fun looksLikeModel(bytes: ByteArray): Boolean = isGlb(bytes) || looksLikeModelJson(bytes)
+
+    private fun stripUtf8Bom(text: String): String =
+        if (text.isNotEmpty() && text[0] == '\uFEFF') text.substring(1) else text
+
+    /**
+     * Diagnóstico REAL do ficheiro para mensagens de erro: nome, tamanho e
+     * primeiros bytes em hexadecimal (+ ASCII imprimível) — permite perceber
+     * de imediato se o ficheiro é GLB, JSON, ZIP, HTML, etc.
+     */
+    fun diagnose(bytes: ByteArray, fileName: String?): String {
+        val head = bytes.take(8).joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
+        val ascii = bytes.take(8).map { b ->
+            val c = (b.toInt() and 0xFF)
+            if (c in 0x20..0x7E) c.toChar() else '·'
+        }.joinToString("")
+        val name = fileName?.takeIf { it.isNotBlank() } ?: "(sem nome)"
+        return "ficheiro: $name · ${bytes.size} bytes · primeiros bytes: [$head] ('$ascii')"
+    }
+
     /**
      * Analisa um ficheiro de modelo (.glb ou .gltf autocontido).
+     * A deteção é SEMPRE pelo conteúdo (magia "glTF" / JSON) — a extensão
+     * e o MIME são irrelevantes.
+     *
+     * @param fileName nome real (OpenableColumns.DISPLAY_NAME) — só para
+     *   diagnóstico nas mensagens de erro.
+     * @param externalFiles ficheiros de apoio selecionados junto com o modelo
+     *   (ex.: o .bin externo de um .gltf, imagens externas), indexados pelo
+     *   nome real de cada um. A correspondência ignora caminho e maiúsculas.
      * @throws GltfParseException com mensagem clara para o Toast/Snackbar.
      */
-    fun parse(bytes: ByteArray): GltfModel {
+    fun parse(
+        bytes: ByteArray,
+        fileName: String? = null,
+        externalFiles: Map<String, ByteArray> = emptyMap()
+    ): GltfModel {
         if (bytes.isEmpty()) throw GltfParseException("Ficheiro vazio — não é um modelo 3D válido")
         if (bytes.size > GltfLimits.MAX_FILE_BYTES) {
             throw GltfParseException(
@@ -118,15 +158,17 @@ object GltfParser {
             jsonText = glb.first
             bin = glb.second
         } else {
-            // glTF JSON solto: validar UTF-8 e ver se não é outro formato qualquer.
+            // glTF JSON solto: validar UTF-8 (com BOM tolerado) e ver se não é
+            // outro formato qualquer (ZIP, HTML, imagem, etc.).
             jsonText = try {
-                String(bytes, Charsets.UTF_8)
+                stripUtf8Bom(String(bytes, Charsets.UTF_8))
             } catch (e: Exception) {
-                throw GltfParseException("Ficheiro não é GLB nem glTF JSON válido", e)
+                throw GltfParseException("Ficheiro não é GLB nem glTF JSON válido — ${diagnose(bytes, fileName)}", e)
             }
             if (!jsonText.trimStart().startsWith("{")) {
                 throw GltfParseException(
-                    "Formato de modelo não suportado. O Pixel One importa glTF 2.0 (.gltf) e GLB (.glb)."
+                    "Formato de modelo não suportado. O Pixel One importa glTF 2.0 (.gltf) e GLB (.glb), " +
+                        "deteção pelo conteúdo — " + diagnose(bytes, fileName)
                 )
             }
         }
@@ -134,10 +176,10 @@ object GltfParser {
         val root = parseJson(jsonText)
         validateAssetAndExtensions(root)
 
-        val buffers = readBuffers(root, bin)
+        val buffers = readBuffers(root, bin, externalFiles)
         val bufferViews = readBufferViews(root, buffers)
         val accessors = root["accessors"] as? List<*> ?: emptyList<Any>()
-        val images = readImages(root, bufferViews)
+        val images = readImages(root, bufferViews, externalFiles)
         val materials = readMaterials(root)
         val meshNames = readMeshNames(root)
 
@@ -365,8 +407,36 @@ object GltfParser {
     // Buffers e bufferViews
     // ------------------------------------------------------------------
 
-    /** Devolve os bytes de cada buffer (por índice), de GLB BIN ou data: URI. */
-    private fun readBuffers(root: Map<String, Any?>, glbBin: ByteArray?): List<ByteArray> {
+    /**
+     * Resolve um URI externo (ex.: "modelo.bin", "./texturas/tex.png") contra
+     * os ficheiros de apoio selecionados pelo utilizador. A correspondência é
+     * pelo NOME REAL do ficheiro (DISPLAY_NAME), sem depender do caminho nem
+     * da extensão: exata, depois basename, depois basename sem sensibilidade
+     * a maiúsculas.
+     */
+    private fun resolveExternal(uri: String, externalFiles: Map<String, ByteArray>): ByteArray? {
+        if (externalFiles.isEmpty()) return null
+        externalFiles[uri]?.let { return it }
+        val base = uri.substringAfterLast('/').substringAfterLast('\\')
+        externalFiles.entries.firstOrNull { it.key.substringAfterLast('/') == base }?.let { return it.value }
+        externalFiles.entries.firstOrNull {
+            it.key.substringAfterLast('/').equals(base, ignoreCase = true)
+        }?.let { return it.value }
+        return null
+    }
+
+    /** MIME de imagem inferido pelo conteúdo/nome — a descodificação real é feita por BitmapFactory. */
+    private fun inferImageMime(fileName: String?): String {
+        val lower = fileName?.lowercase() ?: ""
+        return if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) "image/jpeg" else "image/png"
+    }
+
+    /** Devolve os bytes de cada buffer (por índice), de GLB BIN, data: URI ou .bin externo. */
+    private fun readBuffers(
+        root: Map<String, Any?>,
+        glbBin: ByteArray?,
+        externalFiles: Map<String, ByteArray>
+    ): List<ByteArray> {
         val buffers = root["buffers"] as? List<*> ?: return emptyList()
         return buffers.mapIndexed { index, raw ->
             val b = raw as? Map<*, *> ?: throw GltfParseException("buffers[$index] inválido")
@@ -412,10 +482,26 @@ object GltfParser {
                     }
                     decoded
                 }
-                else -> throw GltfParseException(
-                    "O modelo usa buffer EXTERNO (\"$uri\") — o Pixel One importa apenas " +
-                        "ficheiros autocontidos. Exporta um .glb (ou .gltf com dados embutidos)."
-                )
+                else -> {
+                    // Buffer EXTERNO: resolver contra os ficheiros de apoio
+                    // selecionados (importação .gltf + .bin juntos).
+                    val ext = resolveExternal(uri, externalFiles)
+                    if (ext != null) {
+                        if (declared > ext.size.toLong()) {
+                            throw GltfParseException(
+                                "Buffer externo \"$uri\" declara $declared bytes mas o ficheiro " +
+                                    "selecionado tem ${ext.size}"
+                            )
+                        }
+                        if (ext.size.toLong() != declared) ext.copyOf(declared.toInt()) else ext
+                    } else {
+                        throw GltfParseException(
+                            "O modelo .gltf usa buffer EXTERNO (\"$uri\") e o ficheiro .bin não foi " +
+                                "selecionado. Escolha 1: exporta um .glb AUTOCONTIDO (recomendado). " +
+                                "Escolha 2: importa de novo e seleciona o .gltf JUNTAMENTE com o .bin."
+                        )
+                    }
+                }
             }
         }
     }
@@ -447,7 +533,11 @@ object GltfParser {
     // Imagens, materiais, meshes
     // ------------------------------------------------------------------
 
-    private fun readImages(root: Map<String, Any?>, bufferViews: List<Triple<ByteArray, Int, Int>>): List<GltfImage> {
+    private fun readImages(
+        root: Map<String, Any?>,
+        bufferViews: List<Triple<ByteArray, Int, Int>>,
+        externalFiles: Map<String, ByteArray>
+    ): List<GltfImage> {
         val images = root["images"] as? List<*> ?: return emptyList()
         if (images.size > GltfLimits.MAX_IMAGES) {
             throw GltfParseException(
@@ -456,13 +546,14 @@ object GltfParser {
         }
         return images.mapIndexed { index, raw ->
             val img = raw as? Map<*, *> ?: throw GltfParseException("images[$index] inválido")
-            val mime = (img["mimeType"] as? String) ?: "image/png"
+            val declaredUri = img["uri"] as? String
+            val mime = (img["mimeType"] as? String) ?: inferImageMime(declaredUri)
             if (mime != "image/png" && mime != "image/jpeg") {
                 throw GltfParseException(
                     "Imagem $index com formato não suportado ($mime). Usa PNG ou JPEG."
                 )
             }
-            val uri = img["uri"] as? String
+            val uri = declaredUri
             val bufferViewIndex = (img["bufferView"] as? Number)?.toInt()
             val bytes: ByteArray = when {
                 bufferViewIndex != null -> {
@@ -487,9 +578,14 @@ object GltfParser {
                         throw GltfParseException("images[$index]: base64 inválido", e)
                     }
                 }
-                uri != null -> throw GltfParseException(
-                    "O modelo usa imagem EXTERNA (\"$uri\"). Exporta um .glb com texturas embutidas."
-                )
+                uri != null -> {
+                    // Imagem EXTERNA: resolver contra os ficheiros de apoio.
+                    resolveExternal(uri, externalFiles)
+                        ?: throw GltfParseException(
+                            "O modelo usa imagem EXTERNA (\"$uri\") e o ficheiro não foi selecionado. " +
+                                "Exporta um .glb com texturas embutidas OU seleciona também o ficheiro da imagem."
+                        )
+                }
                 else -> throw GltfParseException("images[$index] sem bufferView nem uri")
             }
             if (bytes.size > GltfLimits.MAX_IMAGE_BYTES) {

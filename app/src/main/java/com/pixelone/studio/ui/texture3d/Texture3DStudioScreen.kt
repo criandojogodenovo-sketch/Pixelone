@@ -141,10 +141,15 @@ fun Texture3DStudioScreen(
     }
 
     // --------------------------- importação SAF ----------------------------
+    // OpenMultipleDocuments com "*/*": o seletor NÃO esconde ficheiros
+    // (qualquer .glb/.gltf/.bin é selecionável, mesmo sem MIME registado no
+    // dispositivo — os contratos de atividade definem EXTRA_MIME_TYPES a
+    // partir da lista; com "*/*" tudo aparece). A seleção múltipla permite
+    // importar um .gltf JUNTAMENTE com o seu .bin externo.
     val importModelLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) viewModel.importModelFromUri(uri)
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (!uris.isNullOrEmpty()) viewModel.importModelFromUris(uris)
     }
 
     // ---------------------- exportações (Ronda B) --------------------------

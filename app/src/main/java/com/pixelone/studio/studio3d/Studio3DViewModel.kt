@@ -3,6 +3,7 @@ package com.pixelone.studio.studio3d
 import android.app.Application
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
@@ -32,6 +33,9 @@ import java.util.concurrent.Executors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** TAG dos registos do caminho de importação 3D (visível no Logcat e no CI). */
+private const val TAG_IMPORT = "PixelOneImport"
 
 /**
  * ViewModel do 3D Texture Studio (Fase 3, Ronda B — PINTURA).
@@ -790,12 +794,19 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Importa um modelo glTF/GLB REAL (análise fora da main thread).
      * @param bytes conteúdo lido (a UI lê com o limite de [GltfLimits.MAX_FILE_BYTES]).
+     * @param externalFiles ficheiros de apoio (.bin/imagens externas) selecionados junto com o modelo.
      * @throws nada — todos os erros viram mensagens em [statusMessage].
      */
-    fun importModel(bytes: ByteArray, fileName: String) {
+    fun importModel(
+        bytes: ByteArray,
+        fileName: String,
+        externalFiles: Map<String, ByteArray> = emptyMap()
+    ) {
         viewModelScope.launch(Dispatchers.Default) {
             try {
                 val startNanos = System.nanoTime()
+                Log.d(TAG_IMPORT, "parse início: $fileName · ${bytes.size} bytes · " +
+                    "extras=${externalFiles.size} (${externalFiles.keys.joinToString(", ")})")
                 if (bytes.size > GltfLimits.MAX_FILE_BYTES) {
                     throw GltfParser.GltfParseException(
                         GltfLimits.tooLargeError(
@@ -803,7 +814,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     )
                 }
-                val parsed = GltfParser.parse(bytes)
+                val parsed = GltfParser.parse(bytes, fileName, externalFiles)
                 // Descodificar imagens embutidas (PNG/JPEG) com limites.
                 val bitmaps = decodeImages(parsed)
                 // Associação inicial: material com textura embutida → EMBEDDED;
@@ -824,6 +835,12 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
                         bindingsOverride = initialBindings
                     )
                     val ms = (System.nanoTime() - startNanos) / 1_000_000L
+                    Log.d(
+                        TAG_IMPORT,
+                        "parse OK: $fileName — ${parsed.meshNames.size} malhas, " +
+                            "${parsed.materials.size} materiais, ${parsed.triangleCount} triângulos, " +
+                            "${parsed.images.size} imagens, $ms ms"
+                    )
                     statusMessage.value = if (parsed.hasUv) {
                         "Modelo carregado: ${parsed.meshNames.size} malhas, " +
                             "${parsed.materials.size} materiais, " +
@@ -835,6 +852,7 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
                     hasUnsavedChanges.value = true
                 }
             } catch (e: Exception) {
+                Log.d(TAG_IMPORT, "parse FALHOU: ${e.message}")
                 withContext(Dispatchers.Main) {
                     statusMessage.value = e.message ?: "Falha ao importar o modelo"
                 }
@@ -843,62 +861,109 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Importação direta de um URI SAF: lê com limite rígido (nunca aloca mais
-     * de [GltfLimits.MAX_FILE_BYTES]) e encaminha para [importModel].
+     * Importação direta de um URI SAF (atalho compatível para um só ficheiro).
      */
     fun importModelFromUri(uri: android.net.Uri) {
+        importModelFromUris(listOf(uri))
+    }
+
+    /**
+     * Importação SAF de UM OU MAIS URIs: o modelo principal é detetado pelo
+     * CONTEÚDO (magia GLB "glTF" ou JSON — nunca pela extensão nem pelo MIME)
+     * e os restantes ficheiros ficam disponíveis como recursos externos
+     * (.bin / imagens). Tudo registado com Log.d para diagnóstico no Logcat/CI.
+     */
+    fun importModelFromUris(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val cr = getApplication<Application>().contentResolver
-                // Nome de apresentação via cursor (sem dependência do caminho).
-                var displayName = "modelo.glb"
-                runCatching {
-                    cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
-                        ?.use { cursor ->
-                            if (cursor.moveToFirst()) {
-                                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                                if (idx >= 0) cursor.getString(idx)?.let { displayName = it }
-                            }
-                        }
-                }
-                // Tamanho ANTES de ler (erro rápido para ficheiros gigantes).
-                val size = runCatching {
-                    cr.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
-                }.getOrDefault(-1L)
-                if (size > GltfLimits.MAX_FILE_BYTES) {
-                    withContext(Dispatchers.Main) {
-                        statusMessage.value = GltfLimits.tooLargeError(
-                            "ficheiro de modelo", size, GltfLimits.MAX_FILE_BYTES
-                        )
+                Log.d(TAG_IMPORT, "Importação iniciada: ${uris.size} ficheiro(s) — $uris")
+                val lidos = ArrayList<Triple<String, ByteArray, android.net.Uri>>()
+                for (uri in uris) {
+                    val name = displayNameOf(cr, uri)
+                    val bytes = readModelBytes(cr, uri, name)
+                    val kind = when {
+                        GltfParser.isGlb(bytes) -> "GLB (magia glTF)"
+                        GltfParser.looksLikeModelJson(bytes) -> "glTF JSON"
+                        else -> "conteúdo desconhecido"
                     }
-                    return@launch
+                    Log.d(TAG_IMPORT, "lido: ${GltfParser.diagnose(bytes, name)} → $kind")
+                    lidos.add(Triple(name, bytes, uri))
                 }
-                val bytes = cr.openInputStream(uri)?.use { input ->
-                    val out = java.io.ByteArrayOutputStream(64 * 1024)
-                    val chunk = ByteArray(64 * 1024)
-                    var total = 0L
-                    while (true) {
-                        val n = input.read(chunk)
-                        if (n < 0) break
-                        total += n
-                        if (total > GltfLimits.MAX_FILE_BYTES) {
-                            throw GltfParser.GltfParseException(
-                                GltfLimits.tooLargeError(
-                                    "ficheiro de modelo", total, GltfLimits.MAX_FILE_BYTES
-                                )
-                            )
-                        }
-                        out.write(chunk, 0, n)
-                    }
-                    out.toByteArray()
-                } ?: throw GltfParser.GltfParseException("Não foi possível ler o ficheiro escolhido")
-                importModel(bytes, displayName)
+                val main = lidos.firstOrNull { GltfParser.looksLikeModel(it.second) }
+                    ?: throw GltfParser.GltfParseException(
+                        "Nenhum dos ficheiros selecionados é um modelo glTF 2.0 (.gltf) ou GLB (.glb) — " +
+                            GltfParser.diagnose(lidos.first().second, lidos.first().first)
+                    )
+                val externals = lidos.filter { it !== main }
+                    .associate { it.first to it.second }
+                Log.d(
+                    TAG_IMPORT,
+                    "modelo principal: ${main.first}; apoio: " +
+                        (if (externals.isEmpty()) "(nenhum)" else externals.keys.joinToString(", "))
+                )
+                importModel(main.second, main.first, externals)
             } catch (e: Exception) {
+                Log.d(TAG_IMPORT, "importação FALHOU", e)
                 withContext(Dispatchers.Main) {
                     statusMessage.value = e.message ?: "Falha ao importar o modelo"
                 }
             }
         }
+    }
+
+    /** Nome real do ficheiro via OpenableColumns.DISPLAY_NAME (nunca pelo caminho do URI). */
+    private fun displayNameOf(cr: android.content.ContentResolver, uri: android.net.Uri): String {
+        var displayName = "modelo"
+        runCatching {
+            cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) cursor.getString(idx)?.let { displayName = it }
+                    }
+                }
+        }
+        return displayName
+    }
+
+    /** Lê o URI com limite rígido (nunca aloca mais de [GltfLimits.MAX_FILE_BYTES]). */
+    private fun readModelBytes(
+        cr: android.content.ContentResolver,
+        uri: android.net.Uri,
+        name: String
+    ): ByteArray {
+        // Tamanho ANTES de ler (erro rápido para ficheiros gigantes).
+        val size = runCatching {
+            cr.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
+        }.getOrDefault(-1L)
+        if (size > GltfLimits.MAX_FILE_BYTES) {
+            throw GltfParser.GltfParseException(
+                GltfLimits.tooLargeError("ficheiro de modelo", size, GltfLimits.MAX_FILE_BYTES)
+            )
+        }
+        return cr.openInputStream(uri)?.use { input ->
+            val out = java.io.ByteArrayOutputStream(64 * 1024)
+            val chunk = ByteArray(64 * 1024)
+            var total = 0L
+            while (true) {
+                val n = input.read(chunk)
+                if (n < 0) break
+                total += n
+                if (total > GltfLimits.MAX_FILE_BYTES) {
+                    throw GltfParser.GltfParseException(
+                        GltfLimits.tooLargeError(
+                            "ficheiro de modelo", total, GltfLimits.MAX_FILE_BYTES
+                        )
+                    )
+                }
+                out.write(chunk, 0, n)
+            }
+            out.toByteArray()
+        } ?: throw GltfParser.GltfParseException(
+            "Não foi possível ler o ficheiro escolhido ($name)"
+        )
     }
 
     private fun decodeImages(model: GltfModel): Map<Int, Bitmap> {
