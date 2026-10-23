@@ -144,11 +144,124 @@ class TexturePaintView(context: Context) : View(context) {
         return paint
     }
 
-    // Paths em cache
+    // Paths em cache (por IDENTIDADE do array de origem — o ViewModel devolve
+    // instâncias estáveis das caches dele; contentHashCode era O(n) POR FRAME:
+    // 3,6 M floats percorridos a cada traço num modelo de 300k triângulos).
     private var uvPath: Path? = null
+    private var uvCacheRef: FloatArray? = null
+    private var uvCacheTexW = 0f
+    private var uvCacheTexH = 0f
     private var islandPath: Path? = null
-    private var uvCacheKey: Int = 0
-    private var islandCacheKey: Int = 0
+    private var islandCacheRef: FloatArray? = null
+    private var islandCacheTexW = 0f
+    private var islandCacheTexH = 0f
+
+    // ------------------------------------------------------------------
+    // MISSÃO TEXTURIZAÇÃO (desempenho do traço em UV/Dividido):
+    // as guias UV + realce da ilha eram desenhados como PATH (até 900k
+    // verbos num modelo de 300k triângulos) EM CADA onDraw — e o traço
+    // invalida a vista a cada evento (60–120 Hz): era a causa dos bloqueios
+    // com modelos importados. AGORA: o overlay é RASTERIZADO UMA VEZ num
+    // bitmap do tamanho da VISTA e o traço faz UM drawBitmap. Rebuild só
+    // quando muda: segmentos/realce (identidade), zoom/pan, tamanho da
+    // vista ou dimensões da textura — NUNCA durante o traço.
+    // ------------------------------------------------------------------
+    private var overlayBitmap: Bitmap? = null
+    private var overlaySegmentsRef: FloatArray? = null
+    private var overlayHighlightRef: FloatArray? = null
+    private var overlayScale = -1f
+    private var overlayTransX = Float.NaN
+    private var overlayTransY = Float.NaN
+    private var overlayViewW = 0
+    private var overlayViewH = 0
+    private var overlayTexW = 0
+    private var overlayTexH = 0
+
+    private fun uvPathFor(segments: FloatArray, texW: Float, texH: Float): Path {
+        val cached = uvPath
+        if (cached != null && uvCacheRef === segments && uvCacheTexW == texW && uvCacheTexH == texH) {
+            return cached
+        }
+        val built = buildWirePath(segments, texW, texH)
+        uvPath = built
+        uvCacheRef = segments
+        uvCacheTexW = texW
+        uvCacheTexH = texH
+        return built
+    }
+
+    private fun islandPathFor(triples: FloatArray, texW: Float, texH: Float): Path {
+        val cached = islandPath
+        if (cached != null && islandCacheRef === triples && islandCacheTexW == texW && islandCacheTexH == texH) {
+            return cached
+        }
+        val built = buildIslandPath(triples, texW, texH)
+        islandPath = built
+        islandCacheRef = triples
+        islandCacheTexW = texW
+        islandCacheTexH = texH
+        return built
+    }
+
+    /**
+     * Devolve o overlay rasterizado (guias UV + realce) para a transformação
+     * e dados atuais — reconstruindo-o SÓ quando a chave muda. null se não
+     * há nada a desenhar (sem guias nem realce) ou vista sem dimensões.
+     */
+    private fun ensureOverlay(bmp: Bitmap): Bitmap? {
+        val segments = uvSegments
+        val highlight = islandHighlightSegments
+        val hasContent = (segments != null && segments.isNotEmpty()) ||
+            (highlight != null && highlight.isNotEmpty())
+        if (!hasContent || width <= 0 || height <= 0) {
+            overlaySegmentsRef = segments
+            overlayHighlightRef = highlight
+            return null
+        }
+        val sameKey =
+            overlaySegmentsRef === segments &&
+            overlayHighlightRef === highlight &&
+            overlayScale == scale &&
+            overlayTransX == transX && overlayTransY == transY &&
+            overlayViewW == width && overlayViewH == height &&
+            overlayTexW == bmp.width && overlayTexH == bmp.height
+        var out = overlayBitmap
+        if (sameKey && out != null && !out.isRecycled) return out
+
+        if (out == null || out.width != width || out.height != height) {
+            out?.recycle()
+            out = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            overlayBitmap = out
+        }
+        out.eraseColor(Color.TRANSPARENT)
+        val texW = bmp.width.toFloat()
+        val texH = bmp.height.toFloat()
+        val c = Canvas(out)
+        c.save()
+        c.translate(transX, transY)
+        c.scale(scale, scale)
+        if (segments != null && segments.isNotEmpty()) {
+            uvPaint.strokeWidth = 1f / scale
+            c.drawPath(uvPathFor(segments, texW, texH), uvPaint)
+        }
+        if (highlight != null && highlight.isNotEmpty()) {
+            islandStrokePaint.strokeWidth = 2f / scale
+            val p = islandPathFor(highlight, texW, texH)
+            c.drawPath(p, islandFillPaint)
+            c.drawPath(p, islandStrokePaint)
+        }
+        c.restore()
+        overlaySegmentsRef = segments
+        overlayHighlightRef = highlight
+        overlayScale = scale
+        overlayTransX = transX
+        overlayTransY = transY
+        overlayViewW = width
+        overlayViewH = height
+        overlayTexW = bmp.width
+        overlayTexH = bmp.height
+        return out
+    }
 
     // ---------------------------- estado de gesto --------------------------
 
@@ -211,34 +324,17 @@ class TexturePaintView(context: Context) : View(context) {
             drawPixelGrid(canvas, bmp.width.toFloat(), bmp.height.toFloat())
         }
 
-        // Sobreposição UV: 1 px de ECRÃ, semitransparente (requisito F).
-        val segments = uvSegments
-        if (segments != null && segments.isNotEmpty()) {
-            val key = segments.contentHashCode()
-            if (uvPath == null || uvCacheKey != key) {
-                uvPath = buildWirePath(segments, bmp.width.toFloat(), bmp.height.toFloat())
-                uvCacheKey = key
-            }
-            uvPaint.strokeWidth = 1f / scale
-            uvPath?.let { canvas.drawPath(it, uvPaint) }
-        }
-
-        // Realce da ilha selecionada: UM path fechado por triângulo
-        // (fill + stroke 2 px de ecrã) — corrige o fill degenerado (H).
-        val highlight = islandHighlightSegments
-        if (highlight != null && highlight.isNotEmpty()) {
-            val key = highlight.contentHashCode()
-            if (islandPath == null || islandCacheKey != key) {
-                islandPath = buildIslandPath(highlight, bmp.width.toFloat(), bmp.height.toFloat())
-                islandCacheKey = key
-            }
-            islandStrokePaint.strokeWidth = 2f / scale
-            islandPath?.let {
-                canvas.drawPath(it, islandFillPaint)
-                canvas.drawPath(it, islandStrokePaint)
-            }
-        }
         canvas.restore()
+
+        // Sobreposição UV + realce da ilha: UM drawBitmap do overlay
+        // rasterizado (antes: drawPath de até 900k verbos POR FRAME do traço
+        // — a causa dos bloqueios com modelos importados). O overlay JÁ TEM
+        // a transformação incorporada (espaço da VISTA) — desenhado FORA do
+        // save/translate/scale, ao contrário dos paths antigos.
+        val overlay = ensureOverlay(bmp)
+        if (overlay != null) {
+            canvas.drawBitmap(overlay, 0f, 0f, null)
+        }
     }
 
     /** Grelha 1 px alinhada aos píxeis da textura (limites de cada píxel). */

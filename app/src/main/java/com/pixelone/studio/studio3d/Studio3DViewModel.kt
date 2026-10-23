@@ -345,6 +345,11 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     /** Início do traço na vista 2D/UV (texel). Um gesto = UMA entrada. */
     fun paintBegin(x: Int, y: Int) {
         if (paintBlockedByTextureSelection()) return
+        // MISSÃO TEXTURIZAÇÃO: a pintura do projeto tem de ficar VISÍVEL no
+        // modelo — materiais que apresentam a textura embutida passam a
+        // apresentar a do projeto (flip ANUNCIADO; as embutidas ficam no
+        // catálogo). Idempotente: sem material EMBEDDED é um no-op barato.
+        ensurePaintVisibleOnModel()
         val doc = compositeDoc
         if (!doc.inBounds(x, y)) return
         lastPaintX = x; lastPaintY = y
@@ -465,6 +470,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     fun fillAt(x: Int, y: Int) {
         val doc = compositeDoc
         if (!doc.inBounds(x, y)) return
+        // Mesma regra do traço: o balde edita o projeto — torna-o visível.
+        ensurePaintVisibleOnModel()
         val color = if (paintState.tool == Tool.ERASER) 0x00000000 else paintState.color
         val tolerance = paintState.fillTolerance
         val scratch = strokeScratch
@@ -586,6 +593,44 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     private fun invalidateMask() {
         cachedMask = null
         maskKey = -1
+    }
+
+    /**
+     * MISSÃO TEXTURIZAÇÃO (pintura invisível em modelos importados):
+     *
+     * CAUSA RAIZ: na importação, materiais com textura embutida ficam com
+     * binding EMBEDDED — o modelo apresenta a textura ORIGINAL do ficheiro,
+     * e a pintura (na textura do PROJETO) não aparecia em lado nenhum do
+     * modelo 3D. O utilizador pintava e nada mudava.
+     *
+     * CORREÇÃO: no início de cada traço/balde, materiais que APRESENTAM
+     * textura embutida passam a apresentar a textura do projeto — flip
+     * ANUNCIADO (nunca silencioso), via [ModelRenderer.setBindings] (sem
+     * rebuild da cena). As bitmaps embutidas NÃO são alteradas nem
+     * descartadas: continuam no catálogo "Texturas do modelo" e os chips
+     * de material as repostas. Sem material EMBEDDED: no-op barato.
+     */
+    private fun ensurePaintVisibleOnModel() {
+        val current = bindings.value ?: return
+        val plan = PaintBinding.ensureDocumentVisible(
+            materials = model.materials.map {
+                TextureCatalog.MaterialInfo(it.name, it.textureImageIndex)
+            },
+            bindings = current
+        )
+        if (plan.isEmpty) return
+        val next = current.toMutableMap().apply { putAll(plan.flips) }
+        bindings.value = next
+        hasUnsavedChanges.value = true
+        renderer?.setBindings(next)
+        postTextureCatalog()
+        val shown = plan.materialNames.take(3).joinToString(", ")
+        val extra = plan.materialNames.size - minOf(3, plan.materialNames.size)
+        statusMessage.value =
+            "Pintura agora visível no modelo: $shown" +
+                (if (extra > 0) " e mais $extra material(is)" else "") +
+                " passam a apresentar a textura do projeto " +
+                "(as texturas originais ficam em \"Texturas do modelo\")"
     }
 
     /**
@@ -1245,7 +1290,9 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         next[materialIndex] = ref
         bindings.value = next
         hasUnsavedChanges.value = true
-        renderer?.setScene(model, embeddedBitmaps, next, sampling.value ?: SamplingMode.NEAREST)
+        // MISSÃO TEXTURIZAÇÃO: setBindings (só ligações, sem rebuild de cena)
+        // em vez de setScene — os chips respondem sem hitch de geometria.
+        renderer?.setBindings(next)
         // MISSÃO: catálogo (usado-por) e vista seguem a nova binding.
         postTextureCatalog()
         syncTextureSelectionWithMaterial(materialIndex)
@@ -1754,24 +1801,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         if (uvSegmentsCacheValid && uvSegmentsCacheFilter == meshFilter) {
             return uvSegmentsCache ?: EMPTY_UV_SEGMENTS
         }
-        val segments = ArrayList<Float>(4096)
-        model.renderables.forEach { r ->
-            if (meshFilter != null && r.meshIndex != meshFilter) return@forEach
-            val uvs = r.uvs ?: return@forEach
-            var i = 0
-            while (i < r.indices.size) {
-                val a = r.indices[i]; val b = r.indices[i + 1]; val c = r.indices[i + 2]
-                segments.add(uvs[a * 2]); segments.add(uvs[a * 2 + 1])
-                segments.add(uvs[b * 2]); segments.add(uvs[b * 2 + 1])
-                segments.add(uvs[b * 2]); segments.add(uvs[b * 2 + 1])
-                segments.add(uvs[c * 2]); segments.add(uvs[c * 2 + 1])
-                segments.add(uvs[c * 2]); segments.add(uvs[c * 2 + 1])
-                segments.add(uvs[a * 2]); segments.add(uvs[a * 2 + 1])
-                i += 3
-            }
-        }
-        val arr = FloatArray(segments.size)
-        for (i in arr.indices) arr[i] = segments[i]
+        // MISSÃO TEXTURIZAÇÃO: construção SEM boxing (UvGuides prealoca o
+        // FloatArray exato — antes eram milhões de Float encaixotado na
+        // thread principal para modelos grandes).
+        val arr = UvGuides.segments(model.renderables, meshFilter)
         uvSegmentsCache = arr
         uvSegmentsCacheFilter = meshFilter
         uvSegmentsCacheValid = true

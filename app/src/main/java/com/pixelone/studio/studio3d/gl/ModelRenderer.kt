@@ -213,6 +213,47 @@ class ModelRenderer(
     }
 
     /**
+     * MISSÃO TEXTURIZAÇÃO: muda APENAS as ligações material → textura, SEM
+     * reconstruir a cena (VBOs/IBOs e texturas embutidas já carregadas
+     * permanecem). Chamado quando a pintura passa a ser apresentada por
+     * materiais que mostravam a textura embutida (flip EMBEDDED → DOCUMENT)
+     * e pelos chips de material — antes, cada mudança de ligação reenviava
+     * a CENA INTEIRA (re-upload de toda a geometria; hitch em modelos
+     * grandes na altura exata em que o traço começa).
+     *
+     * Thread-safe (comando na fila GL); lastSceneRequest é atualizado para a
+     * reconstrução sobreviver a recriações de contexto.
+     */
+    fun setBindings(next: Map<Int, TextureRef>) {
+        pendingOps.add {
+            val s = scene ?: return@add
+            s.bindings = next
+            lastSceneRequest?.let { it.bindings = next }
+            s.model.materials.forEachIndexed { i, material ->
+                when (next[i]
+                    ?: material.textureImageIndex?.let { TextureRef.EMBEDDED }
+                    ?: TextureRef.DOCUMENT) {
+                    TextureRef.DOCUMENT ->
+                        if (documentTexture != 0) s.materialTextures[i] = documentTexture
+                        else s.materialTextures.remove(i)
+                    TextureRef.EMBEDDED -> {
+                        // Reutiliza a textura embutida já carregada; só carrega
+                        // se este material nunca a teve (ligado DOCUMENT/NONE
+                        // na construção da cena).
+                        if (s.materialTextures[i] == null || s.materialTextures[i] == documentTexture) {
+                            val bmp = lastSceneRequest?.embeddedBitmaps?.get(material.textureImageIndex)
+                            if (bmp != null) s.materialTextures[i] = uploadBitmapTexture(bmp)
+                            else s.materialTextures.remove(i)
+                        }
+                    }
+                    TextureRef.NONE -> s.materialTextures.remove(i)
+                }
+            }
+            PerfLog.i(perfTag, "ligações de materiais atualizadas (${next.size} materiais, sem rebuild)")
+        }
+    }
+
+    /**
      * Buffer de subida (thread GL apenas): reutiliza e cresce quando preciso.
      * CORREÇÃO: centraliza a gestão de capacidade de [uploadScratch].
      */
@@ -454,7 +495,8 @@ class ModelRenderer(
         val byIndex: Map<Int, GlRenderable>,
         /** id de textura por material (EMBEDDED e DOCUMENT já resolvidos). */
         val materialTextures: MutableMap<Int, Int>,
-        val bindings: Map<Int, TextureRef>
+        /** var: [setBindings] atualiza as ligações SEM reconstruir a cena. */
+        var bindings: Map<Int, TextureRef>
     ) {
         fun bindingOf(materialIndex: Int): TextureRef =
             bindings[materialIndex]
@@ -465,7 +507,8 @@ class ModelRenderer(
     private class SceneRequest(
         val model: GltfModel,
         val embeddedBitmaps: Map<Int, Bitmap>,
-        val bindings: Map<Int, TextureRef>
+        /** var: [setBindings] mantém o pedido sincronizado com as ligações novas. */
+        var bindings: Map<Int, TextureRef>
     )
 
     private var lastSceneRequest: SceneRequest? = null
