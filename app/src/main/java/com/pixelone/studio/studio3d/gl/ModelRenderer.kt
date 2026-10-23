@@ -182,28 +182,47 @@ class ModelRenderer(
     /**
      * ATUALIZAÇÃO PARCIAL (requisito Fase 3): lê APENAS a região suja do
      * documento e envia-a com glTexSubImage2D. Chamada por traço/fase.
+     *
+     * CORREÇÃO (missão texturização): a extração dos píxeis acontece AGORA
+     * DENTRO do comando GL — antes, a extração escrevia no buffer partilhado
+     * [uploadScratch] na thread chamadora enquanto o GL thread podia estar a
+     * ler o MESMO buffer num glTexSubImage2D ainda pendente: com traços
+     * rápidos, a região N era substituída pelos píxeis da região N+1 e o
+     * modelo 3D mostrava a pintura deslocada/emelindrada (ou aparentemente
+     * ausente). Com a extração na thread GL, [uploadScratch] passa a ser
+     * tocado SÓ pela thread GL (como uploadDocumentFull/uploadBitmapTexture)
+     * e cada comando leva os SEUS píxeis.
      */
     fun updateTextureRegion(rect: DirtyRect, getPixel: (Int) -> Int, docWidth: Int) {
         val w = rect.width
         val h = rect.height
-        if (w <= 0 || h <= 0 || documentTexWidth != docWidth) return
+        if (w <= 0 || h <= 0) return
+        pendingOps.add {
+            // Estado REAL da textura (thread GL): dimensões e existência.
+            if (documentTexture == 0 || documentTexWidth != docWidth) return@add
+            val buf = scratchFor(w * h * 4)
+            RgbaPixels.extractRectToRgba(docWidth, getPixel, rect, buf)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, documentTexture)
+            GLES20.glTexSubImage2D(
+                GLES20.GL_TEXTURE_2D, 0, rect.x0, rect.y0, w, h,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf
+            )
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            PerfLog.i(perfTag, "texSubImage ${w}x${h} em (${rect.x0},${rect.y0})")
+        }
+    }
+
+    /**
+     * Buffer de subida (thread GL apenas): reutiliza e cresce quando preciso.
+     * CORREÇÃO: centraliza a gestão de capacidade de [uploadScratch].
+     */
+    private fun scratchFor(needed: Int): ByteBuffer {
         var buf = uploadScratch
-        val needed = w * h * 4
         if (buf == null || buf.capacity() < needed) {
             buf = ByteBuffer.allocateDirect(needed).order(ByteOrder.nativeOrder())
             uploadScratch = buf
         }
-        RgbaPixels.extractRectToRgba(docWidth, getPixel, rect, buf)
-        pendingOps.add {
-            if (documentTexture != 0) {
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, documentTexture)
-                GLES20.glTexSubImage2D(
-                    GLES20.GL_TEXTURE_2D, 0, rect.x0, rect.y0, w, h,
-                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf
-                )
-                PerfLog.i(perfTag, "texSubImage ${w}x${h} em (${rect.x0},${rect.y0})")
-            }
-        }
+        return buf
     }
 
     /** Realce da ilha selecionada no 3D (null limpa). */
@@ -561,7 +580,7 @@ class ModelRenderer(
         GLES20.glGenTextures(1, tex, 0)
         if (tex[0] == 0) return 0
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
-        val buffer = RgbaPixels.argbToRgbaBuffer(pixels, uploadScratch)
+        val buffer = RgbaPixels.argbToRgbaBuffer(pixels, scratchFor(pixels.size * 4))
         uploadScratch = buffer
         GLES20.glTexImage2D(
             GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
@@ -598,7 +617,7 @@ class ModelRenderer(
         if (documentTexture == 0) return
         lastDocumentPixels = pixels
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, documentTexture)
-        val buffer = RgbaPixels.argbToRgbaBuffer(pixels, uploadScratch)
+        val buffer = RgbaPixels.argbToRgbaBuffer(pixels, scratchFor(pixels.size * 4))
         uploadScratch = buffer
         GLES20.glTexSubImage2D(
             GLES20.GL_TEXTURE_2D, 0, 0, 0,

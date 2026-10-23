@@ -611,9 +611,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         // GPU: APENAS a região suja (requisito do modo Dividido / Ronda B).
         renderer?.updateTextureRegion(rect, { doc.getAt(it) }, doc.width)
         // Redesenho da superfície 2D (bitmap já foi atualizado regionalmente).
-        viewModelScope.launch(Dispatchers.Main) {
-            paintVersion.value = (paintVersion.value ?: 0) + 1
-        }
+        // OTIMIZAÇÃO (missão texturização): postValue em vez de launch+Dispatchers.Main
+        // por evento de movimento — sem alocação de corutina por evento e com
+        // coalescência natural de invalidações rápidas.
+        paintVersion.postValue((paintVersion.value ?: 0) + 1)
         if (hasUnsavedChangesLive) postUnsaved()
     }
 
@@ -627,10 +628,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
             bmp.setPixels(full, 0, doc.width, 0, 0, doc.width, doc.height)
         }
         renderer?.updateTextureRegion(DirtyRect(0, 0, doc.width - 1, doc.height - 1), { doc.getAt(it) }, doc.width)
-        viewModelScope.launch(Dispatchers.Main) {
-            paintVersion.value = (paintVersion.value ?: 0) + 1
-            postLayersState()
-        }
+        paintVersion.postValue((paintVersion.value ?: 0) + 1)
+        postLayersState()
         invalidateMask()
     }
 
@@ -1015,6 +1014,8 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         this.selectedTexture.value = TextureCatalog.DOCUMENT_ID
         lastPickTriangle = -1
         lastPickRenderable = -1
+        // OTIMIZAÇÃO (missão texturização): guias UV em cache morrem com o modelo.
+        invalidateUvGuides()
         // Modo pode ter de recuar se o novo modelo não tiver UV.
         if (!model.hasUv && (mode.value == StudioMode.UV || mode.value == StudioMode.SPLIT)) {
             this.mode.value = StudioMode.THREE_D
@@ -1728,9 +1729,31 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
     // Guias UV e realce de ilha (consumidos pelas vistas)
     // ------------------------------------------------------------------
 
+    // OTIMIZAÇÃO (missão texturização): os segmentos UV e o realce da ilha
+    // eram RECONSTRUÍDOS a cada recomposição dos painéis UV/Dividido — e o
+    // painel recompose a cada evento de movimento do dedo (paintVersion).
+    // Para modelos com muitos triângulos isso significava centenas de KB de
+    // FloatArray + boxing em ArrayList na THREAD PRINCIPAL por evento — a
+    // causa dos bloqueios durante o traço. Agora: cache simples, invalidado
+    // quando o modelo muda (applyModel) e recalculado quando a seleção muda.
+    private var uvSegmentsCache: FloatArray? = null
+    private var uvSegmentsCacheFilter: Int? = null
+    private var uvSegmentsCacheValid = false
+
+    private fun invalidateUvGuides() {
+        uvSegmentsCacheValid = false
+        uvSegmentsCache = null
+        uvSegmentsCacheFilter = null
+        highlightCacheSelection = null
+        highlightCache = null
+    }
+
     /** Segmentos UV (u0,v0,u1,v1) das ilhas — guia para a pintura/overlay.
      *  @param meshFilter índice de malha para filtrar (null = todas). */
     fun uvWireframeSegments(meshFilter: Int? = null): FloatArray {
+        if (uvSegmentsCacheValid && uvSegmentsCacheFilter == meshFilter) {
+            return uvSegmentsCache ?: EMPTY_UV_SEGMENTS
+        }
         val segments = ArrayList<Float>(4096)
         model.renderables.forEach { r ->
             if (meshFilter != null && r.meshIndex != meshFilter) return@forEach
@@ -1749,8 +1772,17 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
         }
         val arr = FloatArray(segments.size)
         for (i in arr.indices) arr[i] = segments[i]
+        uvSegmentsCache = arr
+        uvSegmentsCacheFilter = meshFilter
+        uvSegmentsCacheValid = true
         return arr
     }
+
+    private val EMPTY_UV_SEGMENTS = FloatArray(0)
+
+    /** Cache do realce por INSTÂNCIA da seleção (nova seleção → recalcula). */
+    private var highlightCacheSelection: Any? = null
+    private var highlightCache: FloatArray? = null
 
     /**
      * Triângulos da ilha selecionada em TRIPLOS de vértice (ax,ay,bx,by,cx,cy)
@@ -1759,9 +1791,20 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
      * de realce (fill + stroke).
      */
     fun islandHighlightSegments(): FloatArray? {
-        val sel = selectedIsland.value ?: return null
-        val r = model.renderables.getOrNull(sel.renderableIndex) ?: return null
-        val uvs = r.uvs ?: return null
+        val sel = selectedIsland.value
+        if (sel === highlightCacheSelection) return highlightCache
+        if (sel == null) {
+            highlightCacheSelection = null
+            highlightCache = null
+            return null
+        }
+        val r = model.renderables.getOrNull(sel.renderableIndex)
+        val uvs = r?.uvs
+        if (r == null || uvs == null) {
+            highlightCacheSelection = sel
+            highlightCache = null
+            return null
+        }
         val out = ArrayList<Float>(sel.island.triangleIndices.size * 6)
         for (t in sel.island.triangleIndices) {
             val a = r.indices[t * 3]; val b = r.indices[t * 3 + 1]; val c = r.indices[t * 3 + 2]
@@ -1769,7 +1812,10 @@ class Studio3DViewModel(app: Application) : AndroidViewModel(app) {
             out.add(uvs[b * 2]); out.add(uvs[b * 2 + 1])
             out.add(uvs[c * 2]); out.add(uvs[c * 2 + 1])
         }
-        return FloatArray(out.size) { out[it] }
+        val arr = FloatArray(out.size) { out[it] }
+        highlightCacheSelection = sel
+        highlightCache = arr
+        return arr
     }
 
     /** Píxeis da composição (exportações PNG — textura e gabarito UV). */

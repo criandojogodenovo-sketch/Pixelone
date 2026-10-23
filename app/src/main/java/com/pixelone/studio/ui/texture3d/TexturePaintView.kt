@@ -2,10 +2,12 @@ package com.pixelone.studio.ui.texture3d
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Shader
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -120,6 +122,28 @@ class TexturePaintView(context: Context) : View(context) {
     private val checkerPaintA = Paint().apply { color = Color.argb(255, 34, 34, 34) }
     private val checkerPaintB = Paint().apply { color = Color.argb(255, 22, 22, 22) }
 
+    // OTIMIZAÇÃO (missão texturização): o fundo quadriculado era desenhado
+    // CÉLULA A CÉLULA em TODO onDraw — milhares de drawRect por frame em ecrã
+    // cheio, a cada invalidação do traço. Agora: padrão 2×2 células
+    // pré-renderizado num bitmap 32×32 com BitmapShader REPEAT — um único
+    // drawRect com o MESMO aspeto visual (células 16 px, mesmas cores).
+    private var checkerTiledPaint: Paint? = null
+
+    private fun checkerTiled(): Paint {
+        checkerTiledPaint?.let { return it }
+        val cell = 16
+        val tile = Bitmap.createBitmap(cell * 2, cell * 2, Bitmap.Config.ARGB_8888)
+        val c = Canvas(tile)
+        c.drawRect(0f, 0f, cell.toFloat(), cell.toFloat(), checkerPaintA)
+        c.drawRect(cell.toFloat(), 0f, (cell * 2).toFloat(), cell.toFloat(), checkerPaintB)
+        c.drawRect(0f, cell.toFloat(), cell.toFloat(), (cell * 2).toFloat(), checkerPaintB)
+        c.drawRect(cell.toFloat(), cell.toFloat(), (cell * 2).toFloat(), (cell * 2).toFloat(), checkerPaintA)
+        val paint = Paint()
+        paint.shader = BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+        checkerTiledPaint = paint
+        return paint
+    }
+
     // Paths em cache
     private var uvPath: Path? = null
     private var islandPath: Path? = null
@@ -165,21 +189,9 @@ class TexturePaintView(context: Context) : View(context) {
         val w = width.toFloat()
         val h = height.toFloat()
 
-        // Fundo quadriculado (nunca entra na textura/exportação).
-        val cell = 16f
-        var y = 0f
-        var row = 0
-        while (y < h) {
-            var x = 0f
-            var col = 0
-            while (x < w) {
-                canvas.drawRect(x, y, x + cell, y + cell, if ((row + col) % 2 == 0) checkerPaintA else checkerPaintB)
-                x += cell
-                col++
-            }
-            y += cell
-            row++
-        }
+        // Fundo quadriculado (nunca entra na textura/exportação) — UM drawRect
+        // com padrão em tile (antes: loop célula a célula a cada frame).
+        canvas.drawRect(0f, 0f, w, h, checkerTiled())
 
         if (bmp == null || bmp.isRecycled) return
         if (!fitDone && width > 0 && height > 0) {
@@ -243,11 +255,16 @@ class TexturePaintView(context: Context) : View(context) {
         }
     }
 
-    private fun borderPaint(): Paint = Paint().apply {
+    /** Borda da textura — Paint em cache (antes: alocado em CADA onDraw). */
+    private val borderStrokePaint = Paint().apply {
         color = Color.argb(120, 158, 158, 158)
         style = Paint.Style.STROKE
-        strokeWidth = 1f / scale
         isAntiAlias = false
+    }
+
+    private fun borderPaint(): Paint {
+        borderStrokePaint.strokeWidth = 1f / scale
+        return borderStrokePaint
     }
 
     /**

@@ -73,6 +73,35 @@ class RgbaPixelsTest {
         assertEquals(0x80, bytes[3].toInt() and 0xFF)
     }
 
+    @Test
+    fun `extração repetida no MESMO buffer (scratch GL) é exata em cada chamada`() {
+        // Contrato do novo caminho do updateTextureRegion: a extração corre na
+        // thread GL reutilizando o buffer de subida — cada chamada tem de
+        // começar limpa (position 0) e terminar com remaining() exato, mesmo
+        // após uma extração ANTERIOR ter deixado o buffer "flipado" e com
+        // dados diferentes.
+        val width = 6
+        val doc = IntArray(36) { i ->
+            val x = i % width
+            val y = i / width
+            0xFF000000.toInt() or (x shl 4) or y
+        }
+        val scratch = java.nio.ByteBuffer.allocateDirect(24 * 4).order(ByteOrder.nativeOrder())
+        // 1.ª extração: retângulo maior (3×2).
+        val b1 = RgbaPixels.extractRectToRgba(width, { doc[it] }, DirtyRect(0, 0, 2, 1), scratch)
+        assertEquals(3 * 2 * 4, b1.remaining())
+        assertEquals(0xFF000000.toInt(), readArgb(b1)) // (0,0)
+        // 2.ª extração NO MESMO buffer: retângulo menor (2×2) — clear() tem de
+        // repor a posição e os dados têm de ser os da NOVA região.
+        val b2 = RgbaPixels.extractRectToRgba(width, { doc[it] }, DirtyRect(3, 2, 4, 3), scratch)
+        assertEquals(2 * 2 * 4, b2.remaining())
+        assertTrue(b2 === scratch)
+        assertEquals(0xFF000032.toInt(), readArgb(b2)) // (3,2)
+        assertEquals(0xFF000042.toInt(), readArgb(b2)) // (4,2)
+        assertEquals(0xFF000033.toInt(), readArgb(b2)) // (3,3)
+        assertEquals(0xFF000043.toInt(), readArgb(b2)) // (4,3)
+    }
+
     private fun readArgb(buffer: java.nio.ByteBuffer): Int {
         val r = buffer.get().toInt() and 0xFF
         val g = buffer.get().toInt() and 0xFF
